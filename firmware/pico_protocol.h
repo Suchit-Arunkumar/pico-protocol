@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stddef.h>   // offsetof / size_t, used by the wire-layout assertions
                       // and by crc16()'s size_t parameter below
+#include <string.h>   // memcpy, used by packetCRC() below
 
 // =============================================================================
 // FRAMING
