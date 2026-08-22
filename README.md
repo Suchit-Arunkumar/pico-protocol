@@ -15,7 +15,7 @@ This repository is the protocol layer only — framing, packet structs, CRC, and
 - **LEN** — payload length in bytes (56 for every packet type below)
 - **TYPE** — packet type, see table below
 - **PAYLOAD** — type-specific packed struct, little-endian, always 56 bytes
-- **CRC** — CRC-16 over `[LEN, TYPE, PAYLOAD]` — **not** over the sync bytes. Transmitted big-endian (high byte first), unlike the payload.
+- **CRC** — CRC-16/IBM-3740 over `[LEN, TYPE, PAYLOAD]` — **not** over the sync bytes. Transmitted big-endian (high byte first), unlike the payload. Full parameters below; note it is **not** the KERMIT variant usually meant by "CRC-16-CCITT".
 
 Total packet size: `4 + 56 + 2 = 62 bytes`.
 
@@ -43,6 +43,7 @@ Read from the implementation — `crc16()` in [firmware/pico_protocol.h](firmwar
 
 | Parameter | Value |
 |---|---|
+| Variant | **CRC-16/IBM-3740** (aka "CRC-16/CCITT-FALSE") |
 | Width | 16 bits |
 | Polynomial (normal) | `0x1021` |
 | Polynomial (reversed) | `0x8408` |
@@ -54,7 +55,15 @@ Read from the implementation — `crc16()` in [firmware/pico_protocol.h](firmwar
 | Covers | `[LEN, TYPE, PAYLOAD]`, 58 bytes; excludes the sync bytes |
 | On-wire byte order | Big-endian: `CRC_HI` then `CRC_LO` |
 
-**On the name.** These parameters are **CRC-16/IBM-3740**, widely called "CRC-16/CCITT-FALSE". The computed check value `0x29B1` matches that variant's published check value, so the implementation is correct — but "CRC-16-CCITT", which this README previously used, is ambiguous. In the standard CRC catalogue that name refers to **CRC-16/KERMIT**, which uses `init = 0x0000` with input and output reflection and yields `0x2189` for the same input. The two are not interchangeable. Anyone writing a third-party client for this link should target IBM-3740 and verify against `0x29B1` before touching the wire.
+**This link uses CRC-16/IBM-3740, not the KERMIT variant.** The distinction matters because "CRC-16-CCITT" is used loosely for both, and they do not interoperate:
+
+| | This link — IBM-3740 | "CRC-16-CCITT" — KERMIT |
+|---|---|---|
+| Init | `0xFFFF` | `0x0000` |
+| Reflect in / out | No / No | Yes / Yes |
+| Check value of `"123456789"` | `0x29B1` | `0x2189` |
+
+The implementation here computes `0x29B1`, matching IBM-3740's published check value. Anyone writing a third-party client for this link should target IBM-3740 and verify against `0x29B1` before touching the wire — a library whose `crc16_ccitt()` returns `0x2189` for that input is the wrong variant, and every packet it produces will be rejected.
 
 ## Framing / resync behaviour
 

@@ -59,39 +59,58 @@ The parser is small, self-contained, and has no dynamic allocation, so it is a
 natural fit for libFuzzer or AFL++ against `pp_rx_write()` / `pp_rx_try_parse()`.
 Not done.
 
-## Branch coverage is unmeasured
+## Four parser branches have no test — tests to write
 
-The suite has never been run under `gcov`. Replaying all five tests' byte
-streams through a faithful simulation of the parser shows four paths that no
-test reaches — the sync-byte reject, CRC reject, and accept branches are hit,
-and these are not:
+Replaying all five existing tests' byte streams through a simulation of the
+parser shows the sync-byte reject, CRC reject, and accept branches are hit, and
+four paths are never reached at all. These are the tests to write, one per
+uncovered branch. (Counts are from simulation, not `gcov` on the real binary —
+the suite has never been run under a coverage tool, which is its own gap.)
 
-| Branch | Hits |
-|---|---|
-| `LEN != PAYLOAD_LEN` or unknown `TYPE` reject | **0** |
-| ring buffer wrap (`rx_peek` / `rx_eat` modulo) | **0** |
-| buffer-full short write in `pp_rx_write()` | **0** |
-| a packet split across two `pp_rx_write()` calls | **0** |
+**`test_bad_len_and_unknown_type_rejected`**
+Feed a frame with correct sync bytes and a valid CRC but `LEN != 56`, and a
+second with a `TYPE` outside `{0x01, 0x02, 0x03}`. Both must be rejected, and a
+valid packet placed after them must still be recovered. This is the parser's
+second check, and no current test exercises it as a *rejection*.
 
-The second check in the parser — the one that rejects a bad `LEN` or an unknown
-`TYPE` — is never exercised as a *rejection* by any test. Test 4 looks like it
-should: it plants `0xAA 0x55` inside a payload. But the parser locks onto the
-real header at offset 0 and consumes the whole packet, so it never examines the
-planted bytes at all. The test passes for a reason unrelated to what it claims
-to prove.
+**`test_ring_buffer_wrap`**
+Write and parse more than `RX_BUF_SIZE` (256) bytes' worth of packets in a
+single session, without an intervening `pp_rx_init()`, so `g_head` and `g_tail`
+cross the modulo boundary. Every existing test writes at most 124 bytes after
+init, so the arithmetic that makes the buffer circular has never actually been
+made to wrap. On hardware it wraps within seconds of boot.
 
-The wrap case matters most of the three remaining. Every test writes at most 124
-bytes into a 256-byte buffer after `pp_rx_init()`, so the modulo arithmetic that
-makes the buffer circular has never actually been made to wrap. On hardware it
-wraps within the first few seconds.
+**`test_buffer_full_short_write`**
+Write more bytes than the buffer can hold and assert `pp_rx_write()` returns
+fewer than requested, that the accepted prefix is intact and still parses, and
+that the buffer recovers once drained. The short-write return path is the only
+overflow signal the API offers and nothing currently checks it.
 
-The split-packet case is the normal condition on a real UART — bytes arrive in
-whatever chunks the driver hands over, not in whole packets — and no test covers
-it.
+**`test_packet_split_across_writes`**
+Deliver one packet in several `pp_rx_write()` calls — split mid-header,
+mid-payload, and between the two CRC bytes — asserting `pp_rx_try_parse()`
+returns false until the final chunk lands, then returns the packet intact. This
+is the *normal* case on a real UART, where bytes arrive in whatever chunks the
+driver hands over rather than in whole packets, and no test covers it.
 
-These numbers come from simulation, not from gcov on the real binary, so treat
-them as a strong indication rather than a measurement. Either way, "the resync
-logic is proven correct" is an overstatement of what these five tests establish.
+### Test 4 passes for the wrong reason and needs rewriting
+
+`test_false_header_inside_payload` claims to prove that a coincidental
+`0xAA 0x55` inside payload data doesn't cause a false lock. It plants that pair
+at `pkt[10..11]` and then asserts the outer packet parses.
+
+It cannot fail. The parser locks onto the real header at offset 0, validates it,
+and consumes all 62 bytes — so it never examines the planted bytes at all. The
+assertion passes for a reason unrelated to what the test claims to establish,
+and would keep passing even if false-header handling were completely broken.
+
+To actually test the intent, the fake header must be reached *before* any real
+one: write a run of junk that contains `0xAA 0x55` followed by a plausible-
+looking `LEN`/`TYPE` and then bytes whose CRC does not check out, and only
+after that append a genuine packet. The parser must reject the decoy on the CRC
+check, resync, and recover the real packet. That version exercises the
+false-lock path and fails if the CRC check is removed — the current one does
+not.
 
 ## Ring buffer overflow is detectable but not counted
 
