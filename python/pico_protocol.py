@@ -37,20 +37,110 @@ import struct
 STX1 = 0xAA
 STX2 = 0x55
 
+# Mirrors firmware/pico_protocol.h. PACKET_SIZE is a literal here for the same
+# reason it is there: it is the on-wire truth, and every other size is checked
+# against it below. Deriving it would make those checks vacuous.
+HEADER_SIZE = 4     # STX1 STX2 LEN TYPE
 PAYLOAD_LEN = 56
-PACKET_SIZE = 4 + PAYLOAD_LEN + 2   # STX1 STX2 LEN TYPE + payload + CRC_HI CRC_LO
+CRC_SIZE    = 2     # CRC_HI CRC_LO
+PACKET_SIZE = 62    # total bytes on the wire
 
 TYPE_TELEMETRY = 0x01   # Pico -> Pi
 TYPE_CMD       = 0x02   # Pi   -> Pico
 TYPE_PID       = 0x03   # Pi   -> Pico (firmware-side only, see note above)
 
-# TELEMETRY payload (56 bytes): depth_m, raw_depth_m, pid_u[6], esc_pwm[8],
-# armed, sat_flags, link_ok, reserved[5]
-TELEM_FMT = '<ff6f8H3B5s'
 
-# CMD payload (56 bytes): current pose (6f) + target pose (6f) + armed + seq
-# + reserved[6]
-CMD_FMT = '<12f2B6s'
+# =============================================================================
+# WIRE LAYOUT
+#
+# The field tables below are the single source of truth for this side of the
+# link: the struct format strings are derived from them, so a format string and
+# its documented offsets cannot drift apart. The offsets are then checked
+# against the values asserted on the C side
+# (_Static_assert(offsetof(...)) in firmware/pico_protocol.h), which is what
+# makes the "byte-identical to the C struct" claim actually testable rather
+# than merely asserted in the README.
+#
+# Every field is listed individually -- including each float of a pose -- so
+# that a reordering that preserves total size still fails here. That is the
+# failure mode a size-only check misses: same 56 bytes, wrong meaning, valid
+# CRC, silently wrong values at the far end.
+# =============================================================================
+
+# (field name, struct code) in wire order.
+_TELEM_FIELDS = [
+    ('depth_m',     'f'),
+    ('raw_depth_m', 'f'),
+    ('pid_u',       '6f'),
+    ('esc_pwm',     '8H'),
+    ('armed',       'B'),
+    ('sat_flags',   'B'),
+    ('link_ok',     'B'),
+    ('reserved',    '5s'),
+]
+
+_CMD_FIELDS = [
+    ('current_x',    'f'), ('current_y',     'f'), ('current_z',   'f'),
+    ('current_roll', 'f'), ('current_pitch', 'f'), ('current_yaw', 'f'),
+    ('target_x',     'f'), ('target_y',      'f'), ('target_z',    'f'),
+    ('target_roll',  'f'), ('target_pitch',  'f'), ('target_yaw',  'f'),
+    ('armed',        'B'),
+    ('seq',          'B'),
+    ('reserved',     '6s'),
+]
+
+
+def _require(condition: bool, message: str) -> None:
+    """Layout check that survives `python -O` (unlike a bare `assert`)."""
+    if not condition:
+        raise AssertionError(f'pico_protocol wire layout: {message}')
+
+
+def _build_format(fields) -> str:
+    """Little-endian, no padding -- matches __attribute__((packed)) on the C side."""
+    return '<' + ''.join(code for _, code in fields)
+
+
+def _field_offsets(fields) -> dict:
+    """Byte offset of each field within the payload."""
+    offsets, pos = {}, 0
+    for name, code in fields:
+        offsets[name] = pos
+        pos += struct.calcsize('<' + code)
+    return offsets
+
+
+TELEM_FMT = _build_format(_TELEM_FIELDS)   # '<ff6f8HBBB5s'
+CMD_FMT   = _build_format(_CMD_FIELDS)     # '<ffffffffffffBB6s'
+
+TELEM_OFFSETS = _field_offsets(_TELEM_FIELDS)
+CMD_OFFSETS   = _field_offsets(_CMD_FIELDS)
+
+
+# --- Size checks -------------------------------------------------------------
+_require(HEADER_SIZE + PAYLOAD_LEN + CRC_SIZE == PACKET_SIZE,
+         f'framing constants sum to {HEADER_SIZE + PAYLOAD_LEN + CRC_SIZE}, not {PACKET_SIZE}')
+_require(struct.calcsize(TELEM_FMT) == PAYLOAD_LEN,
+         f'TELEM_FMT is {struct.calcsize(TELEM_FMT)} bytes, not {PAYLOAD_LEN}')
+_require(struct.calcsize(CMD_FMT) == PAYLOAD_LEN,
+         f'CMD_FMT is {struct.calcsize(CMD_FMT)} bytes, not {PAYLOAD_LEN}')
+
+# --- Offset checks: these values are duplicated from the C _Static_asserts ---
+_require(TELEM_OFFSETS == {
+    'depth_m': 0, 'raw_depth_m': 4, 'pid_u': 8, 'esc_pwm': 32,
+    'armed': 48, 'sat_flags': 49, 'link_ok': 50, 'reserved': 51,
+}, f'TELEMETRY offsets disagree with TelemetryPayload: {TELEM_OFFSETS}')
+
+_require(CMD_OFFSETS == {
+    'current_x': 0, 'current_y': 4, 'current_z': 8,
+    'current_roll': 12, 'current_pitch': 16, 'current_yaw': 20,
+    'target_x': 24, 'target_y': 28, 'target_z': 32,
+    'target_roll': 36, 'target_pitch': 40, 'target_yaw': 44,
+    'armed': 48, 'seq': 49, 'reserved': 50,
+}, f'CMD offsets disagree with CommandPayload: {CMD_OFFSETS}')
+
+# NOTE: there is no Python-side PidPayload (TYPE_PID) encoder, so nothing here
+# checks that layout. The C side asserts it alone.
 
 
 # =============================================================================
