@@ -113,7 +113,8 @@ typedef struct __attribute__((packed)) {
     uint8_t  reserved0[3];
     float    gains_a[6];
     float    gains_b[6];
-    uint8_t  tail[4];
+    uint8_t  tail[4];          // bytes 52-55. Reserved for expansion; zero on send,
+                               // ignore on receive. Covered by the CRC.
 } PidPayload;
 // --- Wire layout, TYPE 0x03 -------------------------------------------------
 _Static_assert(HEADER_SIZE + sizeof(PidPayload) + CRC_SIZE == PACKET_SIZE,
@@ -164,9 +165,14 @@ static inline uint16_t crc16(const uint8_t *d, size_t n) {
     return c;
 }
 
-static inline uint16_t packetCRC(uint8_t len, uint8_t type, const uint8_t *payload) {
+// len_field is the LEN *header byte*, hashed as data -- it is NOT the length of
+// `payload`. The CRC always covers exactly PAYLOAD_LEN payload bytes, because
+// every packet type on this link is fixed at 56. Passing anything other than
+// PAYLOAD_LEN produces a CRC over a LEN byte that contradicts the bytes
+// actually hashed, which the receiver will reject as corruption.
+static inline uint16_t packetCRC(uint8_t len_field, uint8_t type, const uint8_t *payload) {
     uint8_t ci[2 + PAYLOAD_LEN];
-    ci[0] = len; ci[1] = type;
+    ci[0] = len_field; ci[1] = type;
     memcpy(&ci[2], payload, PAYLOAD_LEN);
     return crc16(ci, sizeof(ci));
 }
