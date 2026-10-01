@@ -373,27 +373,146 @@ static void test_packet_split_across_writes(void) {
 }
 
 // -----------------------------------------------------------------------
-// Test 10 — pp_*_init() helpers zero every byte, including the reserved
-// ones, so a sender using them can't reproduce the uninitialised-stack-
-// memory bug documented in TODO.md.
+// Test 10 — pp_*_init() helpers zero every byte EXCEPT the version byte
+// (stamped to PROTOCOL_VERSION), including the true reserved bytes, so a
+// sender using them can't reproduce the uninitialised-stack-memory bug
+// documented in TODO.md.
+//
+// Checked field-by-field rather than as one memcmp against an all-zero
+// buffer: the whole point of this struct is that `version` is NOT zero
+// after init, so an all-zero comparison would be asserting the wrong
+// thing. This checks the true reserved bytes are zero and version is
+// exactly PROTOCOL_VERSION, which is what the init helpers actually
+// promise.
 // -----------------------------------------------------------------------
 static void test_init_helpers_zero_reserved_bytes(void) {
-    printf("Test 10: pp_*_init() helpers fully zero their struct, reserved bytes included\n");
+    printf("Test 10: pp_*_init() stamps version, zeros every other byte including reserved\n");
 
     TelemetryPayload t = pp_telemetry_init();
-    uint8_t t_zero[sizeof(TelemetryPayload)];
-    memset(t_zero, 0, sizeof(t_zero));
-    CHECK(memcmp(&t, t_zero, sizeof(t)) == 0, "pp_telemetry_init() produces an all-zero struct");
+    CHECK(t.version == PROTOCOL_VERSION, "pp_telemetry_init() stamps version = PROTOCOL_VERSION");
+    uint8_t t_reserved_zero[sizeof(t.reserved)];
+    memset(t_reserved_zero, 0, sizeof(t_reserved_zero));
+    CHECK(memcmp(t.reserved, t_reserved_zero, sizeof(t.reserved)) == 0,
+          "pp_telemetry_init() zeros the true reserved bytes");
+    CHECK(t.depth_m == 0.0f && t.armed == 0 && t.esc_pwm[0] == 0,
+          "pp_telemetry_init() zeros ordinary fields too");
 
     CommandPayload c = pp_command_init();
-    uint8_t c_zero[sizeof(CommandPayload)];
-    memset(c_zero, 0, sizeof(c_zero));
-    CHECK(memcmp(&c, c_zero, sizeof(c)) == 0, "pp_command_init() produces an all-zero struct");
+    CHECK(c.version == PROTOCOL_VERSION, "pp_command_init() stamps version = PROTOCOL_VERSION");
+    uint8_t c_reserved_zero[sizeof(c.reserved)];
+    memset(c_reserved_zero, 0, sizeof(c_reserved_zero));
+    CHECK(memcmp(c.reserved, c_reserved_zero, sizeof(c.reserved)) == 0,
+          "pp_command_init() zeros the true reserved bytes");
+    CHECK(c.current_x == 0.0f && c.armed == 0 && c.seq == 0,
+          "pp_command_init() zeros ordinary fields too");
 
     PidPayload p = pp_pid_init();
-    uint8_t p_zero[sizeof(PidPayload)];
-    memset(p_zero, 0, sizeof(p_zero));
-    CHECK(memcmp(&p, p_zero, sizeof(p)) == 0, "pp_pid_init() produces an all-zero struct");
+    CHECK(p.version == PROTOCOL_VERSION, "pp_pid_init() stamps version = PROTOCOL_VERSION");
+    CHECK(p.reserved0 == 0, "pp_pid_init() zeros the true reserved byte");
+    CHECK(p.page == 0 && p.txn_id == 0 && p.gains_a[0] == 0.0f,
+          "pp_pid_init() zeros ordinary fields too");
+}
+
+// -----------------------------------------------------------------------
+// Test 12 — pp_packet_version() reads the version byte back out of a
+// decoded payload for each of the three types, and the version stamped
+// by pp_*_init() matches PROTOCOL_VERSION end to end through encode/CRC/
+// decode, not just in the in-memory struct.
+// -----------------------------------------------------------------------
+static void test_packet_version_roundtrip(void) {
+    printf("Test 12: pp_packet_version() reads back the version stamped by pp_*_init() through a real packet\n");
+
+    CommandPayload cmd = pp_command_init();
+    cmd.seq = 9;
+
+    uint8_t pkt[PACKET_SIZE];
+    pkt[0] = STX1; pkt[1] = STX2; pkt[2] = PAYLOAD_LEN; pkt[3] = TYPE_CMD;
+    memcpy(&pkt[4], &cmd, PAYLOAD_LEN);
+    uint16_t crc = packetCRC(PAYLOAD_LEN, TYPE_CMD, &pkt[4]);
+    pkt[4 + PAYLOAD_LEN]     = (crc >> 8) & 0xFF;
+    pkt[4 + PAYLOAD_LEN + 1] = crc & 0xFF;
+
+    pp_rx_init();
+    pp_rx_write(pkt, PACKET_SIZE);
+
+    uint8_t type;
+    uint8_t payload[PAYLOAD_LEN];
+    bool ok = pp_rx_try_parse(&type, payload);
+
+    CHECK(ok, "versioned CMD packet parses");
+    CHECK(pp_packet_version(type, payload) == PROTOCOL_VERSION,
+          "pp_packet_version() reads back PROTOCOL_VERSION after a full encode/CRC/decode round trip");
+    CHECK(pp_packet_version(0xFF, payload) == 0,
+          "pp_packet_version() returns 0 for an unrecognised type");
+}
+
+// -----------------------------------------------------------------------
+// Test 13 — pp_pid_txn_apply_page(): the atomic two-page update helper.
+// Covers: incomplete after one page, complete once both pages of the SAME
+// txn_id land, RESTARTED when a page arrives with a different txn_id
+// mid-transaction (discarding the stale partial page), and PID_NO_CHANGE
+// entries leaving a field at its prior value within the transaction.
+// -----------------------------------------------------------------------
+static void test_pid_transaction_atomic_update(void) {
+    printf("Test 13: pp_pid_txn_apply_page() only completes once both pages of one txn_id land\n");
+
+    // --- one page is not enough -----------------------------------------
+    PidTransaction txn;
+    pp_pid_txn_init(&txn);
+
+    PidPayload page0 = pp_pid_init();
+    page0.page   = 0;
+    page0.txn_id = 42;
+    for (int i = 0; i < 6; i++) { page0.gains_a[i] = 1.0f + i; page0.gains_b[i] = 2.0f + i; }
+
+    PpPidTxnResult r0 = pp_pid_txn_apply_page(&txn, &page0);
+    CHECK(r0 == PP_PID_TXN_INCOMPLETE, "one page alone is PP_PID_TXN_INCOMPLETE");
+
+    // --- the matching second page completes it ---------------------------
+    PidPayload page1 = pp_pid_init();
+    page1.page   = 1;
+    page1.txn_id = 42;
+    for (int i = 0; i < 6; i++) { page1.gains_a[i] = 3.0f + i; page1.gains_b[i] = 4.0f + i; }
+
+    PpPidTxnResult r1 = pp_pid_txn_apply_page(&txn, &page1);
+    CHECK(r1 == PP_PID_TXN_COMPLETE, "matching second page completes the transaction");
+    CHECK(txn.kp[0] == 1.0f && txn.ki[0] == 2.0f && txn.kd[0] == 3.0f && txn.kff[0] == 4.0f,
+          "all four gain arrays assembled correctly from both pages");
+
+    // --- a page with a different txn_id mid-transaction restarts, not merges ---
+    PidTransaction txn2;
+    pp_pid_txn_init(&txn2);
+
+    PidPayload stale_page0 = pp_pid_init();
+    stale_page0.page = 0;
+    stale_page0.txn_id = 1;
+    stale_page0.gains_a[0] = 99.0f;
+    pp_pid_txn_apply_page(&txn2, &stale_page0);   // starts txn_id=1, page0 only
+
+    PidPayload new_page0 = pp_pid_init();
+    new_page0.page = 0;
+    new_page0.txn_id = 2;   // different transaction -- sender restarted
+    new_page0.gains_a[0] = 7.0f;
+
+    PpPidTxnResult r2 = pp_pid_txn_apply_page(&txn2, &new_page0);
+    CHECK(r2 == PP_PID_TXN_RESTARTED, "a page with a new txn_id mid-transaction reports RESTARTED");
+    CHECK(txn2.kp[0] == 7.0f, "the restarted transaction holds the NEW page's data, not the stale one");
+    CHECK(txn2.have_page1 == false, "the restarted transaction does not carry over the stale page1 state");
+
+    // --- PID_NO_CHANGE leaves a field at the transaction's prior value ----
+    PidTransaction txn3;
+    pp_pid_txn_init(&txn3);   // all gain arrays start at 0.0f
+
+    PidPayload partial0 = pp_pid_init();
+    partial0.page = 0;
+    partial0.txn_id = 5;
+    partial0.gains_a[0] = 11.0f;              // kp[0] set
+    partial0.gains_a[1] = PID_NO_CHANGE;      // kp[1] left alone
+    for (int i = 0; i < 6; i++) partial0.gains_b[i] = PID_NO_CHANGE;
+
+    pp_pid_txn_apply_page(&txn3, &partial0);
+    CHECK(txn3.kp[0] == 11.0f, "an explicit gain value is applied");
+    CHECK(txn3.kp[1] == 0.0f, "PID_NO_CHANGE leaves the transaction's prior value (0.0f default) alone");
 }
 
 // -----------------------------------------------------------------------
@@ -437,6 +556,8 @@ int main(void) {
     test_packet_split_across_writes();
     test_init_helpers_zero_reserved_bytes();
     test_pid_validate();
+    test_packet_version_roundtrip();
+    test_pid_transaction_atomic_update();
 
     printf("\n=====================================\n");
     if (g_failures == 0) {

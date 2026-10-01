@@ -133,7 +133,9 @@ while (pp_rx_try_parse(&type, payload)) {
 
 `pp_rx_write()` returns how many bytes it accepted, so a full buffer is detectable rather than silent; `pp_rx_dropped_count()` tracks the running total since the last `pp_rx_init()` for callers that don't check every return value.
 
-Build payload structs with `pp_telemetry_init()` / `pp_command_init()` / `pp_pid_init()` rather than declaring-then-assigning — they zero the whole struct, reserved bytes included, which is otherwise an easy way to put uninitialised stack memory on the wire (see [TODO.md](TODO.md)). Before applying a received `PidPayload`, call `pp_pid_validate()` to reject NaN/±Inf/out-of-range gains.
+Build payload structs with `pp_telemetry_init()` / `pp_command_init()` / `pp_pid_init()` rather than declaring-then-assigning — they zero the whole struct (reserved bytes included, which is otherwise an easy way to put uninitialised stack memory on the wire — see [TODO.md](TODO.md)) and stamp `version = PROTOCOL_VERSION`.
+
+Before applying a received `PidPayload`: call `pp_pid_validate()` to reject NaN/±Inf/out-of-range gains, then feed it to `pp_pid_txn_apply_page()` and only apply kp/ki/kd/kff once it returns `PP_PID_TXN_COMPLETE` — applying each page the instant it arrives leaves the control loop running on a mismatched half-set for at least one tick (see [TODO.md](TODO.md)).
 
 Build and run the test harness on a laptop:
 
@@ -145,13 +147,13 @@ gcc -Wall -Wextra -o test_pico_protocol firmware/test_pico_protocol.c firmware/p
 
 The C firmware implementation — packet structs, CRC, ring buffer, and the resync-safe parser — is my own work. The Python reference implementation was AI-generated and then validated against the C side: the two ends' field offsets are asserted against each other, and the CRC was verified against the published CRC-16/IBM-3740 check value.
 
+## Protocol version
+
+Every payload's first reserved byte is `version`, stamped to `PROTOCOL_VERSION` by `pp_telemetry_init()` / `pp_command_init()` / `pp_pid_init()` and readable back with `pp_packet_version(type, payload)`. This is additive, not a hard break: that byte was already "sender picks, receiver ignores" by the zero-init contract, so an old receiver that only checks `STX`/`LEN`/`TYPE`/CRC keeps working against a new sender unmodified — it just doesn't look at the new byte. What's new is that a receiver *can* now look at it. What to do about a version it doesn't recognise (reject, log-and-accept, ...) is left to the caller — this library reads the byte, it doesn't set firmware policy.
+
 ## Known limitations
 
-Full list in [TODO.md](TODO.md). The one worth stating up front:
-
-**There is no protocol version field.** The header carries `STX1`, `STX2`, `LEN`, and `TYPE` — nothing identifies which revision of a payload layout a packet was built against. Because `TYPE` and `LEN` are unchanged when a payload's internal layout changes, an old Pi-side parser talking to new firmware sees valid sync bytes, a matching `LEN`, a known `TYPE`, and a CRC that is genuinely correct over the new bytes. It accepts the packet and decodes the fields to wrong values, silently — no error, no log line, no CRC failure. On a vehicle that surfaces as inexplicable control behaviour rather than as a link fault.
-
-The mitigation, unimplemented, is to spend one of the reserved payload bytes on a version number and reject unknown versions at the parser. That is itself a breaking change, so it wants to happen at a deliberate cut rather than incrementally.
+Full list in [TODO.md](TODO.md). Fuzzing the parser is still unimplemented — hand-written scenarios only, nothing adversarial has been fed through it.
 
 ## Why a custom protocol instead of something off-the-shelf
 

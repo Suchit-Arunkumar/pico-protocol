@@ -10,10 +10,13 @@ rather than enforcement.
 ## Senders must zero the payload struct — mitigated, not closed
 
 `pico_protocol.h` now provides `pp_telemetry_init()` / `pp_command_init()` /
-`pp_pid_init()`, each returning a fully zeroed struct (verified by Test 10 in
-`test_pico_protocol.c` — every byte, including the reserved ones, is checked
-against an all-zero buffer). The fix for *this repo* is to declare with the
-helper instead of `Struct t; t.field = ...`:
+`pp_pid_init()`, each zeroing the whole struct and then stamping `version =
+PROTOCOL_VERSION` (see the protocol-version section below) — verified by
+Test 10 in `test_pico_protocol.c`, which checks the true reserved bytes are
+zero and every ordinary field defaults to zero, field by field rather than
+one blanket all-zero `memcmp` (that comparison stopped being true the
+moment `version` became a real, non-zero field). The fix for *this repo* is
+to declare with the helper instead of `Struct t; t.field = ...`:
 
 ```c
 TelemetryPayload t = pp_telemetry_init();
@@ -30,11 +33,26 @@ Not done: rejecting non-zero reserved bytes at the receiver (strict, and
 spends the field's forward-compatibility value) — left alone since the
 version-byte work below will want to claim some of that same reserved space.
 
-## No protocol version field
+## No protocol version field — closed
 
-Covered in the README. There is no version byte, so a payload layout change that
-keeps `TYPE` and `LEN` intact produces packets an older parser accepts as valid —
-correct CRC over the new bytes, fields decoded to wrong values, no error raised.
+Every payload's first reserved byte is now `version`, stamped to
+`PROTOCOL_VERSION` (currently `1`) by the `pp_*_init()` helpers and readable
+back out of a decoded payload with `pp_packet_version(type, payload)`.
+Covered end-to-end (encode → CRC → parse → read back) by Test 12.
+
+This is deliberately **not** a hard break: a reserved byte was already
+contractually "sender picks, receiver ignores," so an old receiver that
+only checks STX/LEN/TYPE/CRC keeps working unmodified against a new
+sender — it just never looks at the new version byte. What's genuinely new
+is that a receiver *can* now look at it and decide what to do with a
+version it doesn't recognise.
+
+That decision — reject, log-and-accept, etc. — is deliberately **not**
+made here. `pp_packet_version()` only reads the byte; this library doesn't
+own the firmware's failure-mode policy, and forcing one in would mean
+guessing at a decision that belongs to whoever owns the control loop.
+Wiring an actual rejection policy into a receiver is firmware work,
+outside this repo.
 
 ## The parser has never been fuzzed
 
@@ -90,18 +108,27 @@ AUV firmware, outside this repo, and has not been updated to call
 `pp_pid_validate()` before applying. Wiring that call in is the remaining
 step, and it lives in the other repo.
 
-## The two-page gain update is not atomic
+## The two-page gain update is not atomic — assembly helper added, application still open
 
-A full PID gain set spans two packets: page 0 carries kp and ki, page 1 carries
-kd and kff. They arrive as separate frames, so between the two the control loop
-runs with kp/ki from the new tuning and kd/kff from the old one.
+`PidPayload` now has a `txn_id` byte (spent from what was `reserved0`,
+alongside `version` — see above) that groups the two pages of one logical
+gain update. `pp_pid_txn_init()` / `pp_pid_txn_apply_page()` in
+`pico_protocol.h` assemble both pages before anything is returned as
+ready to apply: feed each received page in, and only once both pages of
+the *same* `txn_id` have landed does it return `PP_PID_TXN_COMPLETE` with
+all four gain arrays (kp/ki/kd/kff) populated together. A page arriving
+with a different `txn_id` while a transaction is only half-done reports
+`PP_PID_TXN_RESTARTED` and discards the stale partial page rather than
+merging it with the new one. Covered by Test 13 (incomplete-after-one-page,
+complete-on-matching-pair, restart-on-mismatched-txn_id,
+`PID_NO_CHANGE`-preserves-prior-value).
 
-At 50 Hz that window is at least one control cycle, longer if page 1 is delayed,
-and unbounded if page 1 is lost entirely — in which case the mismatched set
-stays installed with nothing detecting it. The `PID_NO_CHANGE` sentinel lets a
-sender leave individual gains alone, but there is no mechanism to apply both
-pages as one transaction. A sequence number covering the pair, with
-double-buffered gains swapped only once both pages have landed, would close it.
+Same caveat as the PID validator above: this assembles data, it does not
+apply it. The AUV firmware's `pollPackets()` still applies each page to
+`kp`/`ki`/`kd`/`kff` the instant it arrives, with no transaction grouping
+at all — wiring `pp_pid_txn_apply_page()` into that dispatch loop, and
+having a sender actually set matching `txn_id`s on page 0/page 1 of one
+retune, are both still open and both live in the other repo.
 
 ## CI — closed
 

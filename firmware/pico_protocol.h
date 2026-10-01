@@ -18,6 +18,7 @@
 #include <string.h>   // memcpy, used by packetCRC() below; memset, used by
                       // the pp_*_init() helpers below
 #include <stdbool.h>  // bool, used by pp_pid_validate() below
+#include <math.h>     // fabsf, used by pp_pid_txn_apply_page() below
 
 // =============================================================================
 // FRAMING
@@ -43,6 +44,22 @@ _Static_assert(HEADER_SIZE + PAYLOAD_LEN + CRC_SIZE == PACKET_SIZE,
 #define TYPE_PID        0x03   // Pi  -> Pico: live PID gain update
 
 // =============================================================================
+// PROTOCOL VERSION
+//
+// Spends the first reserved byte of every payload on a version number, per
+// the mitigation TODO.md and the README named but never implemented. This is
+// deliberately NOT a hard break: every reserved byte was already contractually
+// "sender picks, receiver ignores" (see the zero-init contract below), so an
+// old receiver that still just checks STX/LEN/TYPE/CRC and otherwise ignores
+// reserved[0] keeps working unmodified against a new sender. What's new is
+// that a receiver MAY look at this byte and reject a version it doesn't
+// understand -- that policy is deliberately left to the caller (see
+// pp_packet_version() below), not forced here, since this library doesn't
+// own the firmware's failure-mode decisions.
+// =============================================================================
+#define PROTOCOL_VERSION  1
+
+// =============================================================================
 // PAYLOAD STRUCTS  (all __packed__, all exactly 56 bytes)
 // =============================================================================
 
@@ -57,7 +74,9 @@ typedef struct __attribute__((packed)) {
     uint8_t  armed;            // armed state (0/1)
     uint8_t  sat_flags;        // bit0=sat_vert, bit1=sat_horiz, bit2=sat_yaw
     uint8_t  link_ok;          // 1 = link healthy, 0 = lost/timeout
-    uint8_t  reserved[5];      // bytes 51-55. MUST be zeroed by the sender --
+    uint8_t  version;          // byte 51. PROTOCOL_VERSION of the sender --
+                                // was reserved[0]; see PROTOCOL VERSION above.
+    uint8_t  reserved[4];      // bytes 52-55. MUST be zeroed by the sender --
                                // see "zero-initialisation" note below.
 } TelemetryPayload;
 // --- Wire layout, TYPE 0x01 -------------------------------------------------
@@ -74,7 +93,8 @@ _Static_assert(offsetof(TelemetryPayload, esc_pwm)     == 32, "telemetry.esc_pwm
 _Static_assert(offsetof(TelemetryPayload, armed)       == 48, "telemetry.armed moved");
 _Static_assert(offsetof(TelemetryPayload, sat_flags)   == 49, "telemetry.sat_flags moved");
 _Static_assert(offsetof(TelemetryPayload, link_ok)     == 50, "telemetry.link_ok moved");
-_Static_assert(offsetof(TelemetryPayload, reserved)    == 51, "telemetry.reserved moved");
+_Static_assert(offsetof(TelemetryPayload, version)     == 51, "telemetry.version moved");
+_Static_assert(offsetof(TelemetryPayload, reserved)    == 52, "telemetry.reserved moved");
 
 // TYPE 0x02 — CMD (Pi -> Pico)
 typedef struct __attribute__((packed)) {
@@ -84,7 +104,9 @@ typedef struct __attribute__((packed)) {
     float    target_roll, target_pitch, target_yaw;
     uint8_t  armed;
     uint8_t  seq;
-    uint8_t  reserved[6];      // bytes 50-55. MUST be zeroed by the sender --
+    uint8_t  version;          // byte 50. PROTOCOL_VERSION of the sender --
+                                // was reserved[0]; see PROTOCOL VERSION above.
+    uint8_t  reserved[5];      // bytes 51-55. MUST be zeroed by the sender --
                                // see "zero-initialisation" note below.
 } CommandPayload;
 // --- Wire layout, TYPE 0x02 -------------------------------------------------
@@ -104,15 +126,28 @@ _Static_assert(offsetof(CommandPayload, target_pitch)  == 40, "cmd.target_pitch 
 _Static_assert(offsetof(CommandPayload, target_yaw)    == 44, "cmd.target_yaw moved");
 _Static_assert(offsetof(CommandPayload, armed)         == 48, "cmd.armed moved");
 _Static_assert(offsetof(CommandPayload, seq)           == 49, "cmd.seq moved");
-_Static_assert(offsetof(CommandPayload, reserved)      == 50, "cmd.reserved moved");
+_Static_assert(offsetof(CommandPayload, version)       == 50, "cmd.version moved");
+_Static_assert(offsetof(CommandPayload, reserved)      == 51, "cmd.reserved moved");
 
 // TYPE 0x03 — PID tuning (Pi -> Pico)
 // page 0 -> gains_a = kp[6],  gains_b = ki[6]
 // page 1 -> gains_a = kd[6],  gains_b = kff[6]
 // Sentinel PID_NO_CHANGE (-999.0f) on any element means "leave unchanged".
+//
+// txn_id groups the two pages of one logical gain update. A sender doing a
+// full-gains retune sends both pages with the SAME txn_id; pp_pid_transaction_*
+// below (see ATOMIC TWO-PAGE UPDATE) uses it to apply both pages together
+// instead of letting the control loop run for a tick on a mismatched half-set.
+// A sender only ever touching one page (one DOF's kp, say) can leave txn_id
+// at 0 -- nothing requires pairing when there's nothing to pair.
 typedef struct __attribute__((packed)) {
     uint8_t  page;
-    uint8_t  reserved0[3];
+    uint8_t  version;          // byte 1. PROTOCOL_VERSION of the sender --
+                                // was reserved0[0]; see PROTOCOL VERSION above.
+    uint8_t  txn_id;           // byte 2. Pairs page 0 and page 1 of one
+                                // update. Was reserved0[1]; see ATOMIC
+                                // TWO-PAGE UPDATE below.
+    uint8_t  reserved0;        // byte 3. Was reserved0[2].
     float    gains_a[6];
     float    gains_b[6];
     uint8_t  tail[4];          // bytes 52-55. Reserved for expansion; zero on send,
@@ -122,10 +157,26 @@ typedef struct __attribute__((packed)) {
 _Static_assert(HEADER_SIZE + sizeof(PidPayload) + CRC_SIZE == PACKET_SIZE,
                "PidPayload does not fill a 62-byte packet");
 _Static_assert(offsetof(PidPayload, page)      ==  0, "pid.page moved");
-_Static_assert(offsetof(PidPayload, reserved0) ==  1, "pid.reserved0 moved");
+_Static_assert(offsetof(PidPayload, version)   ==  1, "pid.version moved");
+_Static_assert(offsetof(PidPayload, txn_id)    ==  2, "pid.txn_id moved");
+_Static_assert(offsetof(PidPayload, reserved0) ==  3, "pid.reserved0 moved");
 _Static_assert(offsetof(PidPayload, gains_a)   ==  4, "pid.gains_a moved");
 _Static_assert(offsetof(PidPayload, gains_b)   == 28, "pid.gains_b moved");
 _Static_assert(offsetof(PidPayload, tail)      == 52, "pid.tail moved");
+
+// Returns the version byte of a decoded payload, given the packet's TYPE
+// (pp_rx_try_parse()'s out_type). Policy on what to do with a version this
+// receiver doesn't recognise -- reject, log-and-accept, etc. -- is the
+// caller's to make; this just reads the byte so that decision has data to
+// act on. Returns 0 (never a valid PROTOCOL_VERSION) for an unrecognised type.
+static inline uint8_t pp_packet_version(uint8_t type, const uint8_t *payload) {
+    switch (type) {
+        case TYPE_TELEMETRY: return ((const TelemetryPayload *)payload)->version;
+        case TYPE_CMD:        return ((const CommandPayload  *)payload)->version;
+        case TYPE_PID:        return ((const PidPayload      *)payload)->version;
+        default:              return 0;
+    }
+}
 
 #define PID_NO_CHANGE  -999.0f
 
@@ -160,18 +211,21 @@ _Static_assert(offsetof(PidPayload, tail)      == 52, "pid.tail moved");
 static inline TelemetryPayload pp_telemetry_init(void) {
     TelemetryPayload t;
     memset(&t, 0, sizeof(t));
+    t.version = PROTOCOL_VERSION;
     return t;
 }
 
 static inline CommandPayload pp_command_init(void) {
     CommandPayload c;
     memset(&c, 0, sizeof(c));
+    c.version = PROTOCOL_VERSION;
     return c;
 }
 
 static inline PidPayload pp_pid_init(void) {
     PidPayload p;
     memset(&p, 0, sizeof(p));
+    p.version = PROTOCOL_VERSION;
     return p;
 }
 
@@ -236,4 +290,86 @@ static inline bool pp_pid_validate(const PidPayload *p) {
         if (!pp_pid_gain_ok(p->gains_b[i])) return false;
     }
     return true;
+}
+
+// =============================================================================
+// ATOMIC TWO-PAGE UPDATE
+//
+// A full PID retune is two packets: page 0 (kp, ki) and page 1 (kd, kff).
+// Applying each page the instant it arrives -- what the TODO.md gap
+// described, and what the AUV firmware's pollPackets() still does -- means
+// the control loop runs with the new kp/ki and the OLD kd/kff for at least
+// one tick, longer if page 1 is delayed, and keeps the mismatched set
+// installed forever if page 1 is lost.
+//
+// PidTransaction assembles both pages before anything is applied. The
+// caller feeds every received (already-CRC-checked, already-validated)
+// PidPayload into pp_pid_txn_apply_page(); the four gain arrays are only
+// populated, and PP_PID_TXN_COMPLETE only returned, once both pages for the
+// SAME txn_id have landed. The caller applies kp/ki/kd/kff together, in one
+// place, exactly once per completed transaction -- there is no tick where a
+// half-applied set is live.
+//
+// This struct, like pp_pid_validate() above, assembles data; it does not
+// apply it. Applying to a live control loop is firmware work, outside this
+// repo.
+// =============================================================================
+typedef enum {
+    PP_PID_TXN_INCOMPLETE,   // this page landed; waiting on the other one
+    PP_PID_TXN_COMPLETE,     // both pages of this txn_id are now in gains_*
+    PP_PID_TXN_RESTARTED     // a page arrived whose txn_id didn't match the
+                             // one in progress -- the old partial page was
+                             // discarded and this page started a new one
+} PpPidTxnResult;
+
+typedef struct {
+    uint8_t  txn_id;
+    bool     have_page0;
+    bool     have_page1;
+    float    kp[6];
+    float    ki[6];
+    float    kd[6];
+    float    kff[6];
+} PidTransaction;
+
+static inline void pp_pid_txn_init(PidTransaction *txn) {
+    memset(txn, 0, sizeof(*txn));
+}
+
+// Feed one already-validated PidPayload in. Returns what happened; on
+// PP_PID_TXN_COMPLETE, txn->kp/ki/kd/kff hold the full, matched set to apply.
+// PID_NO_CHANGE entries are left as this transaction's prior value (which is
+// 0.0f for a field never touched by either page -- callers wanting "leave
+// the vehicle's current gain alone" for an untouched field should seed
+// txn->kp/ki/kd/kff from the live gains before calling this, not rely on the
+// zero default).
+static inline PpPidTxnResult pp_pid_txn_apply_page(PidTransaction *txn, const PidPayload *p) {
+    PpPidTxnResult result = PP_PID_TXN_INCOMPLETE;
+
+    bool restarted = (txn->have_page0 || txn->have_page1) && (p->txn_id != txn->txn_id);
+    if (restarted) {
+        pp_pid_txn_init(txn);
+        result = PP_PID_TXN_RESTARTED;
+    }
+    txn->txn_id = p->txn_id;
+
+    if (p->page == 0) {
+        for (int i = 0; i < 6; i++) {
+            if (fabsf(p->gains_a[i] - PID_NO_CHANGE) > 0.001f) txn->kp[i] = p->gains_a[i];
+            if (fabsf(p->gains_b[i] - PID_NO_CHANGE) > 0.001f) txn->ki[i] = p->gains_b[i];
+        }
+        txn->have_page0 = true;
+    } else if (p->page == 1) {
+        for (int i = 0; i < 6; i++) {
+            if (fabsf(p->gains_a[i] - PID_NO_CHANGE) > 0.001f) txn->kd[i]  = p->gains_a[i];
+            if (fabsf(p->gains_b[i] - PID_NO_CHANGE) > 0.001f) txn->kff[i] = p->gains_b[i];
+        }
+        txn->have_page1 = true;
+    }
+    // Unknown page numbers: counted as neither page, forward-compatible no-op.
+
+    if (txn->have_page0 && txn->have_page1) {
+        return PP_PID_TXN_COMPLETE;
+    }
+    return result;
 }
