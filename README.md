@@ -131,7 +131,11 @@ while (pp_rx_try_parse(&type, payload)) {
 }
 ```
 
-`pp_rx_write()` returns how many bytes it accepted, so a full buffer is detectable rather than silent. Build and run the test harness on a laptop:
+`pp_rx_write()` returns how many bytes it accepted, so a full buffer is detectable rather than silent; `pp_rx_dropped_count()` tracks the running total since the last `pp_rx_init()` for callers that don't check every return value.
+
+Build payload structs with `pp_telemetry_init()` / `pp_command_init()` / `pp_pid_init()` rather than declaring-then-assigning — they zero the whole struct, reserved bytes included, which is otherwise an easy way to put uninitialised stack memory on the wire (see [TODO.md](TODO.md)). Before applying a received `PidPayload`, call `pp_pid_validate()` to reject NaN/±Inf/out-of-range gains.
+
+Build and run the test harness on a laptop:
 
 ```bash
 gcc -Wall -Wextra -o test_pico_protocol firmware/test_pico_protocol.c firmware/pico_protocol.c && ./test_pico_protocol

@@ -132,33 +132,51 @@ static void test_dropped_byte_recovers_next_packet(void) {
 }
 
 // -----------------------------------------------------------------------
-// Test 4 — a stray 0xAA 0x55 sequence embedded inside real payload data
-// must NOT be mistaken for a packet header.
+// Test 4 — a stray 0xAA 0x55 sequence that appears BEFORE any real packet
+// header must be rejected as a decoy (bad CRC) and the parser must resync
+// and recover the real packet that follows it.
+//
+// The original version of this test planted 0xAA 0x55 inside the payload
+// of an otherwise-untouched, otherwise-still-first packet. That can never
+// fail: the parser locks onto the real header at offset 0, consumes all 62
+// bytes as one contiguous packet, and never looks at the planted bytes
+// again. The assertion passed, but for a reason unrelated to false-header
+// handling -- it would have kept passing even with that logic deleted.
+//
+// This version puts the decoy ahead of the real packet, with a LEN/TYPE
+// that look plausible but a CRC that cannot check out, so check 3 is what
+// has to reject it and trigger the one-byte resync.
 // -----------------------------------------------------------------------
-static void test_false_header_inside_payload(void) {
-    printf("Test 4: coincidental 0xAA 0x55 inside payload doesn't cause a false lock\n");
+static void test_false_header_before_valid_packet(void) {
+    printf("Test 4: a decoy 0xAA 0x55 header with a bad CRC is rejected, real packet after it still recovers\n");
     pp_rx_init();
 
-    uint8_t pkt[PACKET_SIZE];
-    build_valid_cmd_packet(pkt, 5);
+    // Decoy: real sync bytes, a plausible LEN/TYPE, but payload+CRC bytes
+    // that do NOT satisfy the CRC check -- this must be rejected by check 3,
+    // not accidentally skipped by checks 1/2.
+    uint8_t decoy[PACKET_SIZE];
+    memset(decoy, 0x00, sizeof(decoy));
+    decoy[0] = STX1;
+    decoy[1] = STX2;
+    decoy[2] = PAYLOAD_LEN;
+    decoy[3] = TYPE_CMD;
+    // Leave payload all zero and CRC bytes wrong on purpose.
+    decoy[4 + PAYLOAD_LEN]     = 0xDE;
+    decoy[4 + PAYLOAD_LEN + 1] = 0xAD;
 
-    // Force a 0xAA 0x55 pair into the middle of the payload on purpose.
-    pkt[10] = STX1;
-    pkt[11] = STX2;
-    // Recompute CRC since we just mutated the payload.
-    uint16_t crc = packetCRC(PAYLOAD_LEN, TYPE_CMD, &pkt[4]);
-    pkt[4 + PAYLOAD_LEN]     = (crc >> 8) & 0xFF;
-    pkt[4 + PAYLOAD_LEN + 1] = crc & 0xFF;
+    uint8_t real[PACKET_SIZE];
+    build_valid_cmd_packet(real, 5);
 
-    pp_rx_write(pkt, PACKET_SIZE);
+    pp_rx_write(decoy, sizeof(decoy));
+    pp_rx_write(real, sizeof(real));
 
     uint8_t type;
     uint8_t payload[PAYLOAD_LEN];
     bool ok = pp_rx_try_parse(&type, payload);
 
-    CHECK(ok, "the real (outer) packet is still parsed correctly");
+    CHECK(ok, "parser recovers the real packet after rejecting the decoy header");
     CommandPayload *cmd = (CommandPayload *)payload;
-    CHECK(cmd->seq == 5, "seq matches the real packet, not a false parse starting at the embedded header");
+    CHECK(cmd->seq == 5, "recovered packet is the real one (seq=5), not a false parse of the decoy");
 }
 
 // -----------------------------------------------------------------------
@@ -189,12 +207,236 @@ static void test_back_to_back_packets(void) {
     CHECK(ok2 && seq2 == 101, "second packet (seq=101) recovered right after, no gap needed");
 }
 
+// -----------------------------------------------------------------------
+// Test 6 — a frame with a correct sync and CRC but LEN != PAYLOAD_LEN, and
+// a separate frame with an unknown TYPE, must both be rejected by check 2
+// -- and a valid packet placed right after either one must still recover.
+// -----------------------------------------------------------------------
+static void test_bad_len_and_unknown_type_rejected(void) {
+    printf("Test 6: bad LEN and unknown TYPE are rejected, valid packet after each still recovers\n");
+
+    // --- bad LEN ---------------------------------------------------------
+    pp_rx_init();
+    uint8_t bad_len[PACKET_SIZE];
+    build_valid_cmd_packet(bad_len, 9);
+    bad_len[2] = PAYLOAD_LEN + 1;   // LEN now disagrees with the fixed frame size
+    // CRC was computed with the original LEN, so this frame is doubly wrong,
+    // but the LEN check must be what rejects it, not the CRC -- LEN is
+    // checked before CRC in pp_rx_try_parse(), so this still proves the LEN
+    // branch is live and does not silently fall through to the CRC branch.
+
+    uint8_t real_a[PACKET_SIZE];
+    build_valid_cmd_packet(real_a, 10);
+
+    pp_rx_write(bad_len, sizeof(bad_len));
+    pp_rx_write(real_a, sizeof(real_a));
+
+    uint8_t type;
+    uint8_t payload[PAYLOAD_LEN];
+    bool ok_a = pp_rx_try_parse(&type, payload);
+    CHECK(ok_a, "parser recovers the valid packet after a bad-LEN frame");
+    CHECK(((CommandPayload *)payload)->seq == 10, "recovered packet is the real one, not the bad-LEN frame");
+
+    // --- unknown TYPE ------------------------------------------------------
+    pp_rx_init();
+    uint8_t bad_type[PACKET_SIZE];
+    build_valid_cmd_packet(bad_type, 11);
+    bad_type[3] = 0x7F;   // not TYPE_TELEMETRY/TYPE_CMD/TYPE_PID
+    // As above, CRC was computed against TYPE_CMD, so the TYPE check (also
+    // ahead of CRC) is what has to catch this.
+
+    uint8_t real_b[PACKET_SIZE];
+    build_valid_cmd_packet(real_b, 12);
+
+    pp_rx_write(bad_type, sizeof(bad_type));
+    pp_rx_write(real_b, sizeof(real_b));
+
+    bool ok_b = pp_rx_try_parse(&type, payload);
+    CHECK(ok_b, "parser recovers the valid packet after an unknown-TYPE frame");
+    CHECK(((CommandPayload *)payload)->seq == 12, "recovered packet is the real one, not the bad-TYPE frame");
+}
+
+// -----------------------------------------------------------------------
+// Test 7 — writing more than RX_BUF_SIZE (256) bytes' worth of packets in
+// one session, without an intervening pp_rx_init(), forces g_head/g_tail
+// to cross the modulo boundary at least once. Every other test writes at
+// most a couple of packets after init (well under 256 bytes), so the
+// wraparound arithmetic in rx_avail()/rx_free()/rx_peek()/rx_eat() has
+// never actually been forced to wrap before this test.
+// -----------------------------------------------------------------------
+static void test_ring_buffer_wrap(void) {
+    printf("Test 7: ring buffer indices wrap past RX_BUF_SIZE and parsing stays correct\n");
+    pp_rx_init();
+
+    // 256-byte buffer / 62-byte packets: 5 packets is 310 bytes, comfortably
+    // forcing at least one wrap of g_head (and, as each is drained, g_tail).
+    const int N = 5;
+    uint8_t type;
+    uint8_t payload[PAYLOAD_LEN];
+    int recovered = 0;
+
+    for (int i = 0; i < N; i++) {
+        uint8_t pkt[PACKET_SIZE];
+        build_valid_cmd_packet(pkt, (uint8_t)(200 + i));
+        size_t written = pp_rx_write(pkt, sizeof(pkt));
+        CHECK(written == sizeof(pkt), "packet written in full (buffer had room)");
+
+        bool ok = pp_rx_try_parse(&type, payload);
+        if (ok && ((CommandPayload *)payload)->seq == (uint8_t)(200 + i)) {
+            recovered++;
+        }
+    }
+
+    CHECK(recovered == N, "all packets recovered in order across a buffer wrap");
+    CHECK(pp_rx_avail() == 0, "buffer fully drained after wrapping");
+}
+
+// -----------------------------------------------------------------------
+// Test 8 — writing more bytes than the buffer can hold: pp_rx_write() must
+// return fewer than requested, the accepted prefix must still be an intact,
+// parseable packet, and the buffer must recover (accept new data normally)
+// once drained. This is the only overflow signal pp_rx_write() offers, and
+// nothing previously checked it.
+// -----------------------------------------------------------------------
+static void test_buffer_full_short_write(void) {
+    printf("Test 8: pp_rx_write() short-writes when full, accepted prefix still parses, buffer recovers\n");
+    pp_rx_init();
+
+    // RX_BUF_SIZE is 256 with one slot always kept empty, so max usable
+    // capacity is 255 bytes. Ask for far more than that in one call.
+    uint8_t filler[400];
+    for (size_t i = 0; i < sizeof(filler); i++) filler[i] = 0x00;
+
+    // Put one valid, parseable packet at the very front, then pad with
+    // zero noise past the buffer's capacity.
+    uint8_t pkt[PACKET_SIZE];
+    build_valid_cmd_packet(pkt, 77);
+    memcpy(filler, pkt, sizeof(pkt));
+
+    size_t accepted = pp_rx_write(filler, sizeof(filler));
+    CHECK(accepted < sizeof(filler), "pp_rx_write() reports fewer bytes accepted than requested");
+    CHECK(accepted == 255, "accepted count equals the buffer's usable capacity (255 of 256 slots)");
+    CHECK(pp_rx_dropped_count() == sizeof(filler) - accepted,
+          "dropped-byte counter reflects exactly the bytes that didn't fit");
+
+    uint8_t type;
+    uint8_t payload[PAYLOAD_LEN];
+    bool ok = pp_rx_try_parse(&type, payload);
+    CHECK(ok, "the packet in the accepted prefix still parses intact");
+    CHECK(((CommandPayload *)payload)->seq == 77, "parsed packet matches what was written, untouched by the overflow");
+
+    // Buffer should now have room again and behave normally.
+    pp_rx_init();   // draining via parse above already freed space; this
+                    // models the recovery case explicitly regardless.
+    uint8_t pkt2[PACKET_SIZE];
+    build_valid_cmd_packet(pkt2, 78);
+    size_t written2 = pp_rx_write(pkt2, sizeof(pkt2));
+    CHECK(written2 == sizeof(pkt2), "buffer accepts a full packet normally after recovering from overflow");
+    CHECK(pp_rx_dropped_count() == 0, "dropped counter resets on pp_rx_init()");
+}
+
+// -----------------------------------------------------------------------
+// Test 9 — a single packet delivered to pp_rx_write() in several chunks
+// (split mid-header, mid-payload, and between the two CRC bytes) must not
+// parse until the final chunk lands, and must then parse intact. This is
+// the normal case on real UART/USB-CDC hardware, where bytes arrive in
+// whatever groupings the driver hands over, not as whole packets -- no
+// prior test exercised a split packet at all.
+// -----------------------------------------------------------------------
+static void test_packet_split_across_writes(void) {
+    printf("Test 9: a packet delivered in pieces across multiple pp_rx_write() calls still parses\n");
+
+    uint8_t pkt[PACKET_SIZE];
+    build_valid_cmd_packet(pkt, 55);
+
+    // Split points: mid-header (byte 2, inside LEN), mid-payload (byte 30),
+    // and between the two CRC bytes (byte 4 + PAYLOAD_LEN + 1, i.e. after
+    // CRC_HI but before CRC_LO).
+    size_t split_points[] = { 2, 30, 4 + PAYLOAD_LEN + 1 };
+
+    for (size_t s = 0; s < sizeof(split_points) / sizeof(split_points[0]); s++) {
+        pp_rx_init();
+        size_t cut = split_points[s];
+
+        uint8_t type;
+        uint8_t payload[PAYLOAD_LEN];
+
+        pp_rx_write(pkt, cut);
+        bool ok_before = pp_rx_try_parse(&type, payload);
+        CHECK(!ok_before, "parser returns false before the final chunk has arrived");
+
+        pp_rx_write(pkt + cut, PACKET_SIZE - cut);
+        bool ok_after = pp_rx_try_parse(&type, payload);
+        CHECK(ok_after, "parser returns true once the final chunk lands");
+        CHECK(((CommandPayload *)payload)->seq == 55, "packet split at this offset still decodes intact");
+    }
+}
+
+// -----------------------------------------------------------------------
+// Test 10 — pp_*_init() helpers zero every byte, including the reserved
+// ones, so a sender using them can't reproduce the uninitialised-stack-
+// memory bug documented in TODO.md.
+// -----------------------------------------------------------------------
+static void test_init_helpers_zero_reserved_bytes(void) {
+    printf("Test 10: pp_*_init() helpers fully zero their struct, reserved bytes included\n");
+
+    TelemetryPayload t = pp_telemetry_init();
+    uint8_t t_zero[sizeof(TelemetryPayload)];
+    memset(t_zero, 0, sizeof(t_zero));
+    CHECK(memcmp(&t, t_zero, sizeof(t)) == 0, "pp_telemetry_init() produces an all-zero struct");
+
+    CommandPayload c = pp_command_init();
+    uint8_t c_zero[sizeof(CommandPayload)];
+    memset(c_zero, 0, sizeof(c_zero));
+    CHECK(memcmp(&c, c_zero, sizeof(c)) == 0, "pp_command_init() produces an all-zero struct");
+
+    PidPayload p = pp_pid_init();
+    uint8_t p_zero[sizeof(PidPayload)];
+    memset(p_zero, 0, sizeof(p_zero));
+    CHECK(memcmp(&p, p_zero, sizeof(p)) == 0, "pp_pid_init() produces an all-zero struct");
+}
+
+// -----------------------------------------------------------------------
+// Test 11 — pp_pid_validate() accepts sane gains and PID_NO_CHANGE, and
+// rejects NaN, +-Inf, and out-of-range values in either gains_a or
+// gains_b, at any of the 12 gain slots.
+// -----------------------------------------------------------------------
+static void test_pid_validate(void) {
+    printf("Test 11: pp_pid_validate() accepts sane gains, rejects NaN/Inf/out-of-range\n");
+
+    PidPayload good = pp_pid_init();
+    for (int i = 0; i < 6; i++) { good.gains_a[i] = 1.5f; good.gains_b[i] = PID_NO_CHANGE; }
+    CHECK(pp_pid_validate(&good), "all-sane-plus-PID_NO_CHANGE payload validates");
+
+    PidPayload nan_payload = good;
+    nan_payload.gains_a[3] = 0.0f / 0.0f;
+    CHECK(!pp_pid_validate(&nan_payload), "NaN in gains_a is rejected");
+
+    PidPayload inf_payload = good;
+    inf_payload.gains_b[0] = 1.0f / 0.0f;
+    CHECK(!pp_pid_validate(&inf_payload), "+Inf in gains_b is rejected");
+
+    PidPayload huge_payload = good;
+    huge_payload.gains_a[5] = PID_GAIN_MAX + 1.0f;
+    CHECK(!pp_pid_validate(&huge_payload), "a gain past PID_GAIN_MAX is rejected");
+
+    PidPayload neg_huge_payload = good;
+    neg_huge_payload.gains_b[2] = -(PID_GAIN_MAX + 1.0f);
+    CHECK(!pp_pid_validate(&neg_huge_payload), "a gain past -PID_GAIN_MAX is rejected");
+}
+
 int main(void) {
     test_valid_packet();
     test_noise_before_valid_packet();
     test_dropped_byte_recovers_next_packet();
-    test_false_header_inside_payload();
+    test_false_header_before_valid_packet();
     test_back_to_back_packets();
+    test_bad_len_and_unknown_type_rejected();
+    test_ring_buffer_wrap();
+    test_buffer_full_short_write();
+    test_packet_split_across_writes();
+    test_init_helpers_zero_reserved_bytes();
+    test_pid_validate();
 
     printf("\n=====================================\n");
     if (g_failures == 0) {

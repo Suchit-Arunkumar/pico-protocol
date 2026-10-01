@@ -25,6 +25,15 @@ size_t pp_rx_avail(void);
 // Free space currently available for pp_rx_write().
 size_t pp_rx_free(void);
 
+// Count of bytes dropped by pp_rx_write() because the buffer was full at the
+// time, accumulated since the last pp_rx_init(). Saturates at UINT16_MAX
+// rather than wrapping, so a saturated reading is itself a signal ("at least
+// this many, possibly more") instead of a misleadingly small wrapped count.
+// A caller that never checks pp_rx_write()'s return value still has this to
+// poll, so overflow is observable after the fact, not just detectable in the
+// moment it happens.
+uint16_t pp_rx_dropped_count(void);
+
 // Try to pull exactly one valid packet out of the front of the buffer.
 //
 // On success: returns true, *out_type is set to one of TYPE_TELEMETRY /

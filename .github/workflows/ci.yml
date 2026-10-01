@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  firmware-tests:
+    name: C test harness (host-side)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test harness
+        run: gcc -Wall -Wextra -Werror -o test_pico_protocol firmware/test_pico_protocol.c firmware/pico_protocol.c
+      - name: Run test harness
+        run: ./test_pico_protocol
+
+  python-checks:
+    name: Python wire-layout checks + roundtrip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Import module (runs the _require() layout checks at import time)
+        run: python3 -c "import sys; sys.path.insert(0, 'python'); import pico_protocol"
+      - name: Run round-trip example
+        run: python3 python/example_roundtrip.py

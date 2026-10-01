@@ -15,7 +15,9 @@
 #include <stdint.h>
 #include <stddef.h>   // offsetof / size_t, used by the wire-layout assertions
                       // and by crc16()'s size_t parameter below
-#include <string.h>   // memcpy, used by packetCRC() below
+#include <string.h>   // memcpy, used by packetCRC() below; memset, used by
+                      // the pp_*_init() helpers below
+#include <stdbool.h>  // bool, used by pp_pid_validate() below
 
 // =============================================================================
 // FRAMING
@@ -135,21 +137,43 @@ _Static_assert(offsetof(PidPayload, tail)      == 52, "pid.tail moved");
 // / tail[] bytes are therefore real bytes that the sender chooses, and the
 // CRC is computed over them.
 //
-// Senders MUST zero the whole struct before populating it:
+// Skipping zero-init does NOT produce a detectable error. Stack garbage in
+// the reserved bytes is covered by the CRC, so the packet is well-formed and
+// the receiver accepts it. The costs are silent: uninitialised stack memory
+// is transmitted on every frame, and two packets with identical logical
+// content no longer produce identical bytes -- which makes golden-vector
+// tests (compare built packet against known-good bytes) impossible to write.
 //
-//     TelemetryPayload t;
-//     memset(&t, 0, sizeof(t));     // <-- not optional
+// Use the pp_*_init() helpers below instead of declaring-then-assigning:
+// they are the only sanctioned way to get a payload struct into a
+// zero-reserved-bytes state, so "did the sender memset?" becomes "did the
+// sender call the helper?" -- a much easier thing to grep for and review.
+//
+//     TelemetryPayload t = pp_telemetry_init();
 //     t.depth_m = ...;
 //
-// Skipping this does NOT produce a detectable error. Stack garbage in the
-// reserved bytes is covered by the CRC, so the packet is well-formed and the
-// receiver accepts it. The costs are silent: uninitialised stack memory is
-// transmitted on every frame, and two packets with identical logical content
-// no longer produce identical bytes -- which makes golden-vector tests
-// (compare built packet against known-good bytes) impossible to write.
-//
-// The firmware TX path lives outside this repo and is NOT verified here.
+// The firmware TX path lives outside this repo and is NOT verified here --
+// these helpers reduce the chance of the mistake, they cannot prevent a
+// caller from ignoring them.
 // =============================================================================
+
+static inline TelemetryPayload pp_telemetry_init(void) {
+    TelemetryPayload t;
+    memset(&t, 0, sizeof(t));
+    return t;
+}
+
+static inline CommandPayload pp_command_init(void) {
+    CommandPayload c;
+    memset(&c, 0, sizeof(c));
+    return c;
+}
+
+static inline PidPayload pp_pid_init(void) {
+    PidPayload p;
+    memset(&p, 0, sizeof(p));
+    return p;
+}
 
 // =============================================================================
 // CRC-16-CCITT
@@ -175,4 +199,41 @@ static inline uint16_t packetCRC(uint8_t len_field, uint8_t type, const uint8_t 
     ci[0] = len_field; ci[1] = type;
     memcpy(&ci[2], payload, PAYLOAD_LEN);
     return crc16(ci, sizeof(ci));
+}
+
+// =============================================================================
+// PID GAIN VALIDATION
+//
+// The CRC proves a PidPayload arrived intact; it says nothing about whether
+// the gain values inside it were ever sane. A corrupted-but-CRC-valid
+// packet, or a bug on the Pi side, can put NaN, +-Inf, or an absurd
+// magnitude into gains_a/gains_b, and nothing downstream currently rejects
+// that before it reaches a live control loop.
+//
+// This is a pure, allocation-free check the firmware is expected to call
+// before applying a received PidPayload -- it does not apply anything
+// itself (that logic lives in the AUV firmware, outside this repo).
+// PID_NO_CHANGE (-999.0f) is always accepted regardless of the bounds below,
+// since it means "leave this gain alone" rather than "set it to -999".
+// =============================================================================
+#define PID_GAIN_MAX  1000.0f   // generous upper bound for any kp/ki/kd/kff
+                                // this link will ever carry; tune to the
+                                // vehicle's actual gain range if known.
+
+static inline bool pp_pid_gain_ok(float g) {
+    if (g == PID_NO_CHANGE) return true;
+    if (g != g) return false;             // NaN: only value that isn't == itself
+    if (g < -PID_GAIN_MAX || g > PID_GAIN_MAX) return false;  // also catches +-Inf
+    return true;
+}
+
+// Validates every gain in both gains_a[6] and gains_b[6]. Returns true only
+// if all twelve pass pp_pid_gain_ok(). Callers should discard (not apply)
+// a PidPayload for which this returns false.
+static inline bool pp_pid_validate(const PidPayload *p) {
+    for (int i = 0; i < 6; i++) {
+        if (!pp_pid_gain_ok(p->gains_a[i])) return false;
+        if (!pp_pid_gain_ok(p->gains_b[i])) return false;
+    }
+    return true;
 }

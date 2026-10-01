@@ -57,6 +57,11 @@ static uint8_t g_rx[RX_BUF_SIZE];
 static size_t  g_head = 0;   // next write position
 static size_t  g_tail = 0;   // next read position
 
+// Bytes dropped by pp_rx_write() due to a full buffer, since the last
+// pp_rx_init(). Saturating: stops at UINT16_MAX instead of wrapping back to
+// a small number, so a maxed-out reading still reads as "a lot", not zero.
+static uint16_t g_dropped = 0;
+
 static inline size_t rx_avail(void) {
     return (g_head - g_tail + RX_BUF_SIZE) % RX_BUF_SIZE;
 }
@@ -78,10 +83,15 @@ static inline void rx_eat(size_t n) {
 void pp_rx_init(void) {
     g_head = 0;
     g_tail = 0;
+    g_dropped = 0;
 }
 
 size_t pp_rx_free(void) {
     return rx_free();
+}
+
+uint16_t pp_rx_dropped_count(void) {
+    return g_dropped;
 }
 
 size_t pp_rx_avail(void) {
@@ -94,6 +104,14 @@ size_t pp_rx_write(const uint8_t *data, size_t len) {
         g_rx[g_head] = data[n];
         g_head = (g_head + 1) % RX_BUF_SIZE;
         n++;
+    }
+    size_t dropped = len - n;
+    if (dropped > 0) {
+        if (dropped > (size_t)(UINT16_MAX - g_dropped)) {
+            g_dropped = UINT16_MAX;        // saturate, don't wrap
+        } else {
+            g_dropped = (uint16_t)(g_dropped + dropped);
+        }
     }
     return n;   // may be less than len if the buffer filled up
 }

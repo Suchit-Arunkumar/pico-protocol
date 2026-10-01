@@ -7,35 +7,28 @@ rather than enforcement.
 
 ---
 
-## Senders must zero the payload struct, and nothing enforces it
+## Senders must zero the payload struct — mitigated, not closed
 
-Every one of the 56 payload bytes is a named field — there is no
-compiler-inserted padding in these packed structs. The trailing reserved bytes
-(`TelemetryPayload.reserved[5]` at bytes 51–55, `CommandPayload.reserved[6]` at
-50–55, `PidPayload.tail[4]` at 52–55) are real bytes the sender chooses, and the
-CRC is computed over them.
+`pico_protocol.h` now provides `pp_telemetry_init()` / `pp_command_init()` /
+`pp_pid_init()`, each returning a fully zeroed struct (verified by Test 10 in
+`test_pico_protocol.c` — every byte, including the reserved ones, is checked
+against an all-zero buffer). The fix for *this repo* is to declare with the
+helper instead of `Struct t; t.field = ...`:
 
-A sender that declares `TelemetryPayload t;` on the stack and assigns fields
-individually, without `memset`, puts uninitialised stack memory on the wire.
+```c
+TelemetryPayload t = pp_telemetry_init();
+t.depth_m = ...;
+```
 
-This fails silently, in an unhelpful way:
+This does not close the underlying gap, it only makes the correct pattern a
+one-line call instead of a remembered `memset`. **The actual firmware TX path
+lives outside this repo and has not been checked** — nothing here can confirm
+the AUV firmware's telemetry-send code actually calls the helper. That
+verification is still open.
 
-- The CRC is computed *over* the garbage, so it is a valid CRC. The receiver
-  accepts the packet. Nothing errors, nothing logs.
-- Bytes of Pico stack memory are transmitted every frame, at 50 Hz.
-- Byte-level reproducibility is lost. Two packets with identical logical content
-  produce different bytes and different CRCs, which makes golden-vector tests —
-  build a packet, compare against known-good bytes — impossible to write. That
-  forecloses a whole class of testing.
-
-The contract is documented in `firmware/pico_protocol.h`, and both in-repo
-packers honour it: the test harness `memset`s, and the Python builder packs
-explicit zero bytes. **The actual firmware TX path lives outside this repo and
-has not been checked.** That is the thing to go and verify.
-
-Options beyond documenting it: reject non-zero reserved bytes at the receiver
-(strict, and spends the field's forward-compatibility value), or provide an
-init helper that senders are expected to call.
+Not done: rejecting non-zero reserved bytes at the receiver (strict, and
+spends the field's forward-compatibility value) — left alone since the
+version-byte work below will want to claim some of that same reserved space.
 
 ## No protocol version field
 
@@ -59,81 +52,43 @@ The parser is small, self-contained, and has no dynamic allocation, so it is a
 natural fit for libFuzzer or AFL++ against `pp_rx_write()` / `pp_rx_try_parse()`.
 Not done.
 
-## Four parser branches have no test — tests to write
+## Parser branch coverage — closed
 
-Replaying all five existing tests' byte streams through a simulation of the
-parser shows the sync-byte reject, CRC reject, and accept branches are hit, and
-four paths are never reached at all. These are the tests to write, one per
-uncovered branch. (Counts are from simulation, not `gcov` on the real binary —
-the suite has never been run under a coverage tool, which is its own gap.)
+Tests 6–9 in `test_pico_protocol.c` now cover the four previously-untested
+branches (`test_bad_len_and_unknown_type_rejected`, `test_ring_buffer_wrap`,
+`test_buffer_full_short_write`, `test_packet_split_across_writes`), and Test 4
+was rewritten as `test_false_header_before_valid_packet`. Note the rename:
+the old test planted a decoy header *inside* an otherwise-intact first
+packet, which the parser never examines before consuming the whole 62 bytes
+— it could not fail no matter what false-header handling did. The rewrite
+puts the decoy *before* the real packet with a CRC that cannot check out, so
+check 3 and the one-byte resync are what have to do the work.
 
-**`test_bad_len_and_unknown_type_rejected`**
-Feed a frame with correct sync bytes and a valid CRC but `LEN != 56`, and a
-second with a `TYPE` outside `{0x01, 0x02, 0x03}`. Both must be rejected, and a
-valid packet placed after them must still be recovered. This is the parser's
-second check, and no current test exercises it as a *rejection*.
+Caveat still open: these are hand-simulated branch counts, not `gcov`/`lcov`
+on the compiled binary. Running an actual coverage tool against the 11 tests
+now in the harness is unverified — do that before trusting "all branches
+covered" as more than an informed guess.
 
-**`test_ring_buffer_wrap`**
-Write and parse more than `RX_BUF_SIZE` (256) bytes' worth of packets in a
-single session, without an intervening `pp_rx_init()`, so `g_head` and `g_tail`
-cross the modulo boundary. Every existing test writes at most 124 bytes after
-init, so the arithmetic that makes the buffer circular has never actually been
-made to wrap. On hardware it wraps within seconds of boot.
+## Ring buffer overflow — closed
 
-**`test_buffer_full_short_write`**
-Write more bytes than the buffer can hold and assert `pp_rx_write()` returns
-fewer than requested, that the accepted prefix is intact and still parses, and
-that the buffer recovers once drained. The short-write return path is the only
-overflow signal the API offers and nothing currently checks it.
+`pp_rx_dropped_count()` returns a saturating `uint16_t` of bytes dropped by
+`pp_rx_write()` since the last `pp_rx_init()` (saturates at `UINT16_MAX`
+rather than wrapping, so a maxed reading still reads as "a lot", not zero).
+Covered by Test 8. A caller that never checks `pp_rx_write()`'s return value
+can now poll this after the fact.
 
-**`test_packet_split_across_writes`**
-Deliver one packet in several `pp_rx_write()` calls — split mid-header,
-mid-payload, and between the two CRC bytes — asserting `pp_rx_try_parse()`
-returns false until the final chunk lands, then returns the packet intact. This
-is the *normal* case on a real UART, where bytes arrive in whatever chunks the
-driver hands over rather than in whole packets, and no test covers it.
+## PID gains are not bounds-checked — validator added, application still open
 
-### Test 4 passes for the wrong reason and needs rewriting
+`pp_pid_validate()` in `pico_protocol.h` rejects NaN, ±Inf, and anything past
+`PID_GAIN_MAX` (currently ±1000.0f — a generous placeholder, not a vehicle-
+tuned limit) in any of the 12 gain slots, while still accepting
+`PID_NO_CHANGE`. Covered by Test 11.
 
-`test_false_header_inside_payload` claims to prove that a coincidental
-`0xAA 0x55` inside payload data doesn't cause a false lock. It plants that pair
-at `pkt[10..11]` and then asserts the outer packet parses.
-
-It cannot fail. The parser locks onto the real header at offset 0, validates it,
-and consumes all 62 bytes — so it never examines the planted bytes at all. The
-assertion passes for a reason unrelated to what the test claims to establish,
-and would keep passing even if false-header handling were completely broken.
-
-To actually test the intent, the fake header must be reached *before* any real
-one: write a run of junk that contains `0xAA 0x55` followed by a plausible-
-looking `LEN`/`TYPE` and then bytes whose CRC does not check out, and only
-after that append a genuine packet. The parser must reject the decoy on the CRC
-check, resync, and recover the real packet. That version exercises the
-false-lock path and fails if the CRC check is removed — the current one does
-not.
-
-## Ring buffer overflow is detectable but not counted
-
-`pp_rx_write()` returns the number of bytes it accepted, which is fewer than
-requested when the buffer is full — so a caller *can* detect overflow. Nothing
-records it. There is no counter, no flag, and no way to answer "did we drop
-bytes during that run, and how many" after the fact.
-
-A caller that ignores the return value loses bytes silently, and the resulting
-symptom is an unexplained CRC failure or a missing packet rather than an
-overflow report. A saturating `uint16_t` counter plus a getter would make the
-condition observable in telemetry.
-
-## PID gains are not bounds-checked
-
-The protocol layer accepts whatever 32-bit floats arrive in `gains_a` /
-`gains_b` and passes them through. There is no range check, no NaN or infinity
-rejection, and no sanity limit. A corrupted-but-CRC-valid packet, or a Pi-side
-bug, can install a gain of `1e30` or `NaN` into a live control loop.
-
-CRC catches corruption in transit; it does nothing about a value that was wrong
-before it was framed. Per-gain bounds belong either at this layer or at the
-point of application.
+This is a pure check, callable but **not yet called**: the code that
+receives a `PidPayload` and applies it to the live control loop lives in the
+AUV firmware, outside this repo, and has not been updated to call
+`pp_pid_validate()` before applying. Wiring that call in is the remaining
+step, and it lives in the other repo.
 
 ## The two-page gain update is not atomic
 
@@ -148,9 +103,9 @@ sender leave individual gains alone, but there is no mechanism to apply both
 pages as one transaction. A sequence number covering the pair, with
 double-buffered gains swapped only once both pages have landed, would close it.
 
-## No CI
+## CI — closed
 
-Nothing builds the firmware, runs the test harness, or imports the Python module
-automatically. All verification to date has been run by hand. The test harness
-already exits non-zero on failure, so it is ready to drop into a CI step
-whenever one exists.
+`.github/workflows/ci.yml` builds the test harness with `-Wall -Wextra
+-Werror` and runs it, and separately imports the Python module (triggering
+its `_require()` wire-layout checks) and runs `example_roundtrip.py`. Both
+jobs run on every push and PR.
