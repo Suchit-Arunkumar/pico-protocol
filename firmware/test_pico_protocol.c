@@ -2,21 +2,17 @@
 // test_pico_protocol.c
 // Host-side test harness for pico_protocol.c / pico_protocol_rx.h.
 //
-// Compiles and runs on a laptop (plain gcc, no Pico/Arduino toolchain, no
-// hardware) so the resync logic can be proven correct BEFORE it ever touches
-// a real UART. Build & run:
+// Runs on a host machine with plain gcc or clang -- no Pico toolchain, no
+// hardware. From the repository root:
 //
-//   gcc -Wall -Wextra -o test_pico_protocol test_pico_protocol.c pico_protocol.c
-//   ./test_pico_protocol
+//   make test
 //
-// Every test ends with a pass/fail printout; the process exits non-zero if
-// any test fails, so it can be dropped straight into a CI step later.
+// Exits non-zero if any check fails.
 // =============================================================================
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include "pico_protocol.h"
 #include "pico_protocol_rx.h"
 
@@ -31,22 +27,12 @@ static int g_failures = 0;
 // Uses a distinctive, checkable seq byte so tests can confirm WHICH packet
 // was recovered after corruption/noise.
 static void build_valid_cmd_packet(uint8_t *out, uint8_t seq) {
-    CommandPayload cmd;
-    memset(&cmd, 0, sizeof(cmd));
+    CommandPayload cmd = pp_command_init();
     cmd.current_x = 1.0f;
     cmd.target_z  = -2.5f;
     cmd.armed     = 1;
     cmd.seq       = seq;
-
-    out[0] = STX1;
-    out[1] = STX2;
-    out[2] = PAYLOAD_LEN;
-    out[3] = TYPE_CMD;
-    memcpy(&out[4], &cmd, PAYLOAD_LEN);
-
-    uint16_t crc = packetCRC(PAYLOAD_LEN, TYPE_CMD, &out[4]);
-    out[4 + PAYLOAD_LEN]     = (crc >> 8) & 0xFF;
-    out[4 + PAYLOAD_LEN + 1] = crc & 0xFF;
+    pp_frame(TYPE_CMD, &cmd, out);
 }
 
 // -----------------------------------------------------------------------
@@ -136,16 +122,11 @@ static void test_dropped_byte_recovers_next_packet(void) {
 // header must be rejected as a decoy (bad CRC) and the parser must resync
 // and recover the real packet that follows it.
 //
-// The original version of this test planted 0xAA 0x55 inside the payload
-// of an otherwise-untouched, otherwise-still-first packet. That can never
-// fail: the parser locks onto the real header at offset 0, consumes all 62
-// bytes as one contiguous packet, and never looks at the planted bytes
-// again. The assertion passed, but for a reason unrelated to false-header
-// handling -- it would have kept passing even with that logic deleted.
-//
-// This version puts the decoy ahead of the real packet, with a LEN/TYPE
-// that look plausible but a CRC that cannot check out, so check 3 is what
-// has to reject it and trigger the one-byte resync.
+// The decoy must come BEFORE the real packet. A decoy planted inside an
+// already-locked packet's payload is never examined -- the parser consumes
+// the whole 62 bytes once the outer CRC passes -- so such a test cannot
+// fail. Here the decoy has plausible LEN/TYPE and a CRC that cannot match,
+// so the CRC check is what must reject it and trigger the one-byte resync.
 // -----------------------------------------------------------------------
 static void test_false_header_before_valid_packet(void) {
     printf("Test 4: a decoy 0xAA 0x55 header with a bad CRC is rejected, real packet after it still recovers\n");
@@ -295,8 +276,8 @@ static void test_ring_buffer_wrap(void) {
 // Test 8 — writing more bytes than the buffer can hold: pp_rx_write() must
 // return fewer than requested, the accepted prefix must still be an intact,
 // parseable packet, and the buffer must recover (accept new data normally)
-// once drained. This is the only overflow signal pp_rx_write() offers, and
-// nothing previously checked it.
+// once drained. The drop counter must account for exactly the bytes
+// refused.
 // -----------------------------------------------------------------------
 static void test_buffer_full_short_write(void) {
     printf("Test 8: pp_rx_write() short-writes when full, accepted prefix still parses, buffer recovers\n");
@@ -375,15 +356,9 @@ static void test_packet_split_across_writes(void) {
 // -----------------------------------------------------------------------
 // Test 10 — pp_*_init() helpers zero every byte EXCEPT the version byte
 // (stamped to PROTOCOL_VERSION), including the true reserved bytes, so a
-// sender using them can't reproduce the uninitialised-stack-memory bug
-// documented in TODO.md.
+// sender using them never transmits uninitialised memory.
 //
-// Checked field-by-field rather than as one memcmp against an all-zero
-// buffer: the whole point of this struct is that `version` is NOT zero
-// after init, so an all-zero comparison would be asserting the wrong
-// thing. This checks the true reserved bytes are zero and version is
-// exactly PROTOCOL_VERSION, which is what the init helpers actually
-// promise.
+// Checked field by field, since version is deliberately non-zero.
 // -----------------------------------------------------------------------
 static void test_init_helpers_zero_reserved_bytes(void) {
     printf("Test 10: pp_*_init() stamps version, zeros every other byte including reserved\n");
@@ -426,11 +401,7 @@ static void test_packet_version_roundtrip(void) {
     cmd.seq = 9;
 
     uint8_t pkt[PACKET_SIZE];
-    pkt[0] = STX1; pkt[1] = STX2; pkt[2] = PAYLOAD_LEN; pkt[3] = TYPE_CMD;
-    memcpy(&pkt[4], &cmd, PAYLOAD_LEN);
-    uint16_t crc = packetCRC(PAYLOAD_LEN, TYPE_CMD, &pkt[4]);
-    pkt[4 + PAYLOAD_LEN]     = (crc >> 8) & 0xFF;
-    pkt[4 + PAYLOAD_LEN + 1] = crc & 0xFF;
+    pp_frame(TYPE_CMD, &cmd, pkt);
 
     pp_rx_init();
     pp_rx_write(pkt, PACKET_SIZE);
@@ -463,7 +434,7 @@ static void test_pid_transaction_atomic_update(void) {
     PidPayload page0 = pp_pid_init();
     page0.page   = 0;
     page0.txn_id = 42;
-    for (int i = 0; i < 6; i++) { page0.gains_a[i] = 1.0f + i; page0.gains_b[i] = 2.0f + i; }
+    for (int i = 0; i < 6; i++) { page0.gains_a[i] = 1.0f + (float)i; page0.gains_b[i] = 2.0f + (float)i; }
 
     PpPidTxnResult r0 = pp_pid_txn_apply_page(&txn, &page0);
     CHECK(r0 == PP_PID_TXN_INCOMPLETE, "one page alone is PP_PID_TXN_INCOMPLETE");
@@ -472,7 +443,7 @@ static void test_pid_transaction_atomic_update(void) {
     PidPayload page1 = pp_pid_init();
     page1.page   = 1;
     page1.txn_id = 42;
-    for (int i = 0; i < 6; i++) { page1.gains_a[i] = 3.0f + i; page1.gains_b[i] = 4.0f + i; }
+    for (int i = 0; i < 6; i++) { page1.gains_a[i] = 3.0f + (float)i; page1.gains_b[i] = 4.0f + (float)i; }
 
     PpPidTxnResult r1 = pp_pid_txn_apply_page(&txn, &page1);
     CHECK(r1 == PP_PID_TXN_COMPLETE, "matching second page completes the transaction");
@@ -544,6 +515,115 @@ static void test_pid_validate(void) {
     CHECK(!pp_pid_validate(&neg_huge_payload), "a gain past -PID_GAIN_MAX is rejected");
 }
 
+// -----------------------------------------------------------------------
+// Test 14 — golden vectors shared with python/test_pico_protocol.py.
+//
+// The same hex strings appear verbatim in the Python tests. Here the
+// packets are built from the C structs; there, from the Python encoder.
+// Both passing is what demonstrates byte-identical output across the two
+// implementations, beyond agreement on sizes and offsets.
+// -----------------------------------------------------------------------
+static int hex_to_bytes(const char *hex, uint8_t *out, size_t cap) {
+    size_t n = strlen(hex) / 2;
+    if (n > cap) return -1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned v;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1) return -1;
+        out[i] = (uint8_t)v;
+    }
+    return (int)n;
+}
+
+static void test_golden_vectors_match_python(void) {
+    printf("Test 14: C-built packets match the golden vectors the Python tests also check\n");
+
+    static const char *GOLDEN_CMD =
+        "aa5538020000803f000000000000000000000000000000000000000000000000"
+        "00000000000020c0000000000000000000000000012a0100000000006e8e";
+    static const char *GOLDEN_PID_PAGE0 =
+        "aa553803000109000000803f0000004000004040000080400000a0400000c040"
+        "00c079c400c079c400c079c400c079c400c079c400c079c4000000006a60";
+
+    uint8_t expect[PACKET_SIZE], got[PACKET_SIZE];
+
+    CommandPayload cmd = pp_command_init();
+    cmd.current_x = 1.0f;
+    cmd.target_z  = -2.5f;
+    cmd.armed     = 1;
+    cmd.seq       = 42;
+    pp_frame(TYPE_CMD, &cmd, got);
+    CHECK(hex_to_bytes(GOLDEN_CMD, expect, sizeof expect) == PACKET_SIZE &&
+          memcmp(got, expect, PACKET_SIZE) == 0,
+          "CMD packet is byte-identical to the Python encoder's output");
+
+    PidPayload pid = pp_pid_init();
+    pid.page   = 0;
+    pid.txn_id = 9;
+    for (int i = 0; i < 6; i++) { pid.gains_a[i] = (float)(i + 1); pid.gains_b[i] = PID_NO_CHANGE; }
+    pp_frame(TYPE_PID, &pid, got);
+    CHECK(hex_to_bytes(GOLDEN_PID_PAGE0, expect, sizeof expect) == PACKET_SIZE &&
+          memcmp(got, expect, PACKET_SIZE) == 0,
+          "PID page-0 packet is byte-identical to the Python encoder's output");
+
+    CHECK(crc16((const uint8_t *)"123456789", 9) == 0x29B1,
+          "crc16() matches the published CRC-16/IBM-3740 check value 0x29B1");
+}
+
+// -----------------------------------------------------------------------
+// Test 15 — randomized stress. Valid packets interleaved with random noise
+// (biased toward 0xAA/0x55/56 so false headers are common), delivered
+// through pp_rx_write() in random chunk sizes from 1 to 40 bytes, parsed
+// as the bytes arrive. Every packet must be recovered exactly once, in
+// order, with its seq intact. Seeded xorshift PRNG for reproducibility.
+//
+// This is property-based stress testing, not coverage-guided fuzzing; see
+// LIMITATIONS.md.
+// -----------------------------------------------------------------------
+static uint32_t g_rng = 0x2545F491u;
+static uint32_t rng(void) {
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5;
+    return g_rng;
+}
+
+static void test_randomized_noise_stress(void) {
+    printf("Test 15: randomized noise + random chunking, every packet recovered in order\n");
+    pp_rx_init();
+
+    enum { N_PACKETS = 2000 };
+    static uint8_t stream[N_PACKETS * (PACKET_SIZE + 48)];
+    size_t len = 0;
+
+    for (int k = 0; k < N_PACKETS; k++) {
+        size_t noise = rng() % 48;
+        for (size_t i = 0; i < noise; i++) {
+            uint32_t r = rng() % 8;
+            stream[len++] = (r == 0) ? STX1 : (r == 1) ? STX2 : (r == 2) ? PAYLOAD_LEN
+                          : (uint8_t)rng();
+        }
+        build_valid_cmd_packet(&stream[len], (uint8_t)k);
+        len += PACKET_SIZE;
+    }
+
+    int recovered = 0, in_order = 1;
+    size_t pos = 0;
+    uint8_t type, payload[PAYLOAD_LEN];
+
+    while (pos < len) {
+        size_t chunk = 1 + rng() % 40;
+        if (chunk > len - pos) chunk = len - pos;
+        pos += pp_rx_write(&stream[pos], chunk);
+        while (pp_rx_try_parse(&type, payload)) {
+            if (type != TYPE_CMD || ((CommandPayload *)payload)->seq != (uint8_t)recovered)
+                in_order = 0;
+            recovered++;
+        }
+    }
+
+    CHECK(recovered == N_PACKETS, "all 2000 packets recovered from the noisy stream");
+    CHECK(in_order, "packets recovered in order with intact seq, no false accepts");
+    CHECK(pp_rx_dropped_count() == 0, "no bytes dropped (writer never outpaced the parser)");
+}
+
 int main(void) {
     test_valid_packet();
     test_noise_before_valid_packet();
@@ -558,6 +638,8 @@ int main(void) {
     test_pid_validate();
     test_packet_version_roundtrip();
     test_pid_transaction_atomic_update();
+    test_golden_vectors_match_python();
+    test_randomized_noise_stress();
 
     printf("\n=====================================\n");
     if (g_failures == 0) {
