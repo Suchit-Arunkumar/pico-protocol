@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: libFuzzer runtime for the runner's clang
+        run: sudo apt-get update && sudo apt-get install -y "libclang-rt-$(clang --version | sed -n 's/.*version \([0-9]*\).*/\1/p' | head -1)-dev"
       - run: make fuzz
       - run: mkdir -p build/corpus && cp firmware/fuzz_corpus/* build/corpus/
       - run: ./build/fuzz_rx -max_total_time=60 build/corpus
