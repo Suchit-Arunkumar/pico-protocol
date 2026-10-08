@@ -66,6 +66,8 @@ make test        # C suite (sanitizers on) + Python suite + round-trip example
 
 The resync tests were mutation-checked: disabling the CRC comparison in the parser causes three independent tests to fail.
 
+`make fuzz` builds a libFuzzer harness (`firmware/fuzz_rx.c`, clang) over the receive path. It checks that every accepted packet has a known TYPE and, re-framed, appears contiguously in the input. CI runs it for 60 s on every push.
+
 ## Usage
 
 ### Firmware (C)
@@ -159,7 +161,7 @@ LIMITATIONS.md            known gaps
 
 ## Limitations
 
-The parser is single-instance and not interrupt-safe as shipped, coverage-guided fuzzing has not been run, and testing is host-side only. Full list in [LIMITATIONS.md](LIMITATIONS.md).
+The parser is single-instance and not interrupt-safe as shipped, fuzzing is limited to short runs, and testing is host-side only. Full list in [LIMITATIONS.md](LIMITATIONS.md).
 
 ## Authorship
 

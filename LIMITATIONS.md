@@ -15,13 +15,15 @@ ordering it is not formally safe. The intended use today is to call both
 from the same context (drain the UART, then parse, in the main loop). A
 context-struct API with C11 atomics would remove both restrictions.
 
-## No coverage-guided fuzzing
+## Fuzzing is short and single-instance
 
-The parser is exercised by hand-written edge cases and by a seeded randomized
-stress test (2,000 packets in biased noise, random chunking, under ASan and
-UBSan). That is property-based testing, not coverage-guided fuzzing. A
-libFuzzer or AFL++ harness over `pp_rx_write()` / `pp_rx_try_parse()` has not
-been run.
+`firmware/fuzz_rx.c` is a libFuzzer harness over `pp_rx_write()` /
+`pp_rx_try_parse()` under ASan and UBSan. Besides memory safety it checks that
+every accepted packet has a known TYPE and, re-framed, appears contiguously in
+the input. It found nothing in about 3 million runs locally, and CI runs it for
+60 s per push from a three-file seed corpus of valid packets. Disabling the CRC
+comparison makes it fail within seconds, so the contract check is live. It has
+not had a long (hours) campaign or a persistent corpus.
 
 ## Coverage is not measured
 

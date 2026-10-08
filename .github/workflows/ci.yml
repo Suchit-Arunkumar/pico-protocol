@@ -24,3 +24,12 @@ jobs:
         with:
           python-version: "3.x"
       - run: make test-python
+
+  fuzz:
+    name: libFuzzer, receive path (60 s)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: make fuzz
+      - run: mkdir -p build/corpus && cp firmware/fuzz_corpus/* build/corpus/
+      - run: ./build/fuzz_rx -max_total_time=60 build/corpus
