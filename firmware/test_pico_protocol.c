@@ -624,6 +624,33 @@ static void test_randomized_noise_stress(void) {
     CHECK(pp_rx_dropped_count() == 0, "no bytes dropped (writer never outpaced the parser)");
 }
 
+// ---------------------------------------------------------------------------
+// Link watchdog: false before the first CMD, true for PP_LINK_TIMEOUT_MS after
+// each feed, false from then on, and unaffected by the millisecond counter
+// wrapping. Version read-back works on an unaligned payload buffer.
+// ---------------------------------------------------------------------------
+static void test_link_watchdog(void) {
+    printf("\n[test_link_watchdog]\n");
+    PpLinkWatchdog w;
+    pp_link_init(&w);
+    CHECK(!pp_link_ok(&w, 0) && !pp_link_ok(&w, 12345), "not ok before any command");
+
+    pp_link_feed(&w, 1000);
+    CHECK(pp_link_ok(&w, 1000), "ok on the tick it was fed");
+    CHECK(pp_link_ok(&w, 1000 + PP_LINK_TIMEOUT_MS - 1), "ok 1 ms before the timeout");
+    CHECK(!pp_link_ok(&w, 1000 + PP_LINK_TIMEOUT_MS), "lost exactly at the timeout");
+
+    pp_link_feed(&w, UINT32_MAX - 100);
+    CHECK(pp_link_ok(&w, 50), "ok across the 2^32 ms wrap (151 ms later)");
+    CHECK(!pp_link_ok(&w, PP_LINK_TIMEOUT_MS), "lost across the wrap once the timeout passes");
+
+    uint8_t buf[PAYLOAD_LEN + 1];
+    CommandPayload c = pp_command_init();
+    memcpy(&buf[1], &c, sizeof c);                     // deliberately misaligned
+    CHECK(pp_packet_version(TYPE_CMD, &buf[1]) == PROTOCOL_VERSION,
+          "version read from a misaligned payload buffer");
+}
+
 int main(void) {
     test_valid_packet();
     test_noise_before_valid_packet();
@@ -640,6 +667,7 @@ int main(void) {
     test_pid_transaction_atomic_update();
     test_golden_vectors_match_python();
     test_randomized_noise_stress();
+    test_link_watchdog();
 
     printf("\n=====================================\n");
     if (g_failures == 0) {

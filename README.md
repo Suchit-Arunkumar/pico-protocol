@@ -11,7 +11,7 @@ The firmware side is portable C11 with no allocation and no SDK dependencies; th
 - **Self-resynchronising parser.** Recovers from dropped, corrupted, or misaligned bytes within one packet width. Validated against 2,000 packets buried in noise biased toward sync and header bytes and delivered in random chunk sizes.
 - **Layout pinned at compile time and import time.** Every field offset of every payload is asserted with `_Static_assert` in C and checked against the same values when the Python module loads. A field reorder that keeps the size unchanged — which would still pass the CRC and silently decode to wrong values — fails the build.
 - **Cross-language golden vectors.** The same reference packets are checked by the C test suite (built from C structs) and the Python test suite (built from the Python encoder).
-- **Control-safety helpers.** NaN/Inf/range validation for live PID gain updates, and a transaction layer that applies two-packet gain updates atomically, so the controller never runs on a half-updated gain set.
+- **Control-safety helpers.** NaN/Inf/range validation for live PID gain updates, a transaction layer that applies two-packet gain updates atomically so the controller never runs on a half-updated gain set, and a wrap-safe command-timeout watchdog (500 ms by default) for the failsafe.
 - **Strict CI.** `-std=c11 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror`, built with both GCC and Clang, run under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ## Wire format
@@ -60,7 +60,7 @@ make test        # C suite (sanitizers on) + Python suite + round-trip example
 
 | Suite | What it covers |
 |---|---|
-| C — 15 tests, 70 checks | Clean parse; leading noise; dropped byte mid-packet; decoy header with bad CRC; back-to-back packets; bad LEN / unknown TYPE; ring-buffer index wraparound; buffer-full short write and drop counter; packets split across writes at header, payload, and CRC boundaries; init helpers; PID validation; version round-trip; atomic PID transactions; golden vectors and CRC check value; randomized noise stress |
+| C — 16 tests, 77 checks | Clean parse; leading noise; dropped byte mid-packet; decoy header with bad CRC; back-to-back packets; bad LEN / unknown TYPE; ring-buffer index wraparound; buffer-full short write and drop counter; packets split across writes at header, payload, and CRC boundaries; init helpers; PID validation; version round-trip; atomic PID transactions; golden vectors and CRC check value; randomized noise stress; link-watchdog timeout and counter wrap |
 | Python — 9 tests | CRC check value; golden vectors; PID encoder paging and transaction IDs; telemetry resync, CRC rejection, and partial-buffer handling |
 | Compile time | Size and offset of every payload field, in both languages |
 
@@ -75,24 +75,34 @@ The resync tests were mutation-checked: disabling the CRC comparison in the pars
 #include "pico_protocol_rx.h"
 
 pp_rx_init();
+static PidTransaction txn;   // pp_pid_txn_init(&txn) once at startup
+static PpLinkWatchdog link;  // pp_link_init(&link) once at startup
 
 // In the main loop: feed whatever bytes the UART / USB CDC produced.
 pp_rx_write(rx_bytes, n);
 
 uint8_t type, payload[PAYLOAD_LEN];
-static PidTransaction txn;   // pp_pid_txn_init(&txn) once at startup
 
+// Copy into a typed struct rather than casting the byte buffer: no alignment
+// or strict-aliasing assumptions about `payload`.
 while (pp_rx_try_parse(&type, payload)) {
     if (type == TYPE_CMD) {
-        const CommandPayload *cmd = (const CommandPayload *)payload;
+        CommandPayload cmd;
+        memcpy(&cmd, payload, sizeof cmd);
+        pp_link_feed(&link, now_ms);
         /* update setpoint from cmd */
     } else if (type == TYPE_PID) {
-        const PidPayload *p = (const PidPayload *)payload;
-        if (pp_pid_validate(p) &&
-            pp_pid_txn_apply_page(&txn, p) == PP_PID_TXN_COMPLETE) {
+        PidPayload p;
+        memcpy(&p, payload, sizeof p);
+        if (pp_pid_validate(&p) &&
+            pp_pid_txn_apply_page(&txn, &p) == PP_PID_TXN_COMPLETE) {
             /* copy txn.kp / ki / kd / kff into the controller together */
         }
     }
+}
+
+if (!pp_link_ok(&link, now_ms)) {
+    /* no valid CMD for PP_LINK_TIMEOUT_MS (500 ms default): disarm, neutral */
 }
 
 // Transmit telemetry.

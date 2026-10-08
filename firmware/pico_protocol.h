@@ -190,13 +190,49 @@ static inline PidPayload pp_pid_init(void) {
 
 // Version byte of a decoded payload, given the TYPE from pp_rx_try_parse().
 // Returns 0 -- never a valid PROTOCOL_VERSION -- for an unknown type.
+// Reads the byte at its pinned offset rather than through a struct pointer,
+// so the payload buffer needs no particular alignment or effective type.
 static inline uint8_t pp_packet_version(uint8_t type, const uint8_t *payload) {
     switch (type) {
-        case TYPE_TELEMETRY: return ((const TelemetryPayload *)payload)->version;
-        case TYPE_CMD:       return ((const CommandPayload   *)payload)->version;
-        case TYPE_PID:       return ((const PidPayload       *)payload)->version;
+        case TYPE_TELEMETRY: return payload[offsetof(TelemetryPayload, version)];
+        case TYPE_CMD:       return payload[offsetof(CommandPayload,   version)];
+        case TYPE_PID:       return payload[offsetof(PidPayload,       version)];
         default:             return 0;
     }
+}
+
+// =============================================================================
+// LINK WATCHDOG
+//
+// The receiver's half of the command-timeout failsafe. Feed it the time of
+// every valid CMD packet; pp_link_ok() turns false once PP_LINK_TIMEOUT_MS
+// have passed without one, and is false until the first feed. What to do on
+// timeout (disarm, neutral thrust) belongs to the firmware.
+//
+// now_ms is any free-running millisecond counter. The unsigned subtraction
+// stays correct across its wrap at 2^32 ms (49.7 days).
+// =============================================================================
+#ifndef PP_LINK_TIMEOUT_MS
+#define PP_LINK_TIMEOUT_MS  500u   // override before including this header
+#endif
+
+typedef struct {
+    uint32_t last_ms;
+    bool     seen;
+} PpLinkWatchdog;
+
+static inline void pp_link_init(PpLinkWatchdog *w) {
+    w->last_ms = 0;
+    w->seen    = false;
+}
+
+static inline void pp_link_feed(PpLinkWatchdog *w, uint32_t now_ms) {
+    w->last_ms = now_ms;
+    w->seen    = true;
+}
+
+static inline bool pp_link_ok(const PpLinkWatchdog *w, uint32_t now_ms) {
+    return w->seen && (uint32_t)(now_ms - w->last_ms) < PP_LINK_TIMEOUT_MS;
 }
 
 // =============================================================================
