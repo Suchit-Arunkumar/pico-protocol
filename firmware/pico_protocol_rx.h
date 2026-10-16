@@ -12,8 +12,10 @@
 // Reset the ring buffer to empty. Call once at startup.
 void pp_rx_init(void);
 
-// Feed up to `len` bytes into the ring buffer (e.g. from a UART RX ISR,
-// DMA-drained region, or Serial.read() in a polling loop).
+// Feed up to `len` bytes into the ring buffer (e.g. Serial.read() or a
+// drained DMA region in a polling loop). Call from the same context as
+// pp_rx_try_parse(); not interrupt-safe as shipped, so an interrupt-driven
+// design needs the caller to add its own locking.
 // Returns the number of bytes actually accepted — fewer than `len` if the
 // buffer is full, so the caller can detect/report overflow instead of
 // silently losing bytes.

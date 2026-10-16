@@ -4,9 +4,12 @@
 // Receive path for the Pi <-> Pico protocol: a bounded ring buffer and a
 // resynchronising packet parser.
 //
-// Portable C11 with no SDK dependencies. Bytes can be fed from a UART ISR, a
-// DMA completion handler, or a polling loop; the parser does not care how
-// they arrived or in what chunk sizes.
+// Portable C11 with no SDK dependencies. The parser does not care how bytes
+// arrived or in what chunk sizes, but pp_rx_write() and pp_rx_try_parse()
+// must be called from one context only (e.g. drain the UART, then parse, in
+// the main loop). The ring buffer is not interrupt-safe as shipped; an
+// interrupt-driven design needs the caller to add its own locking. See
+// LIMITATIONS.md.
 //
 // RESYNC
 // ------
