@@ -142,7 +142,7 @@ bool pp_rx_try_parse(uint8_t *out_type, uint8_t *out_payload) {
             continue;
         }
 
-        // --- Check 3: CRC-16-CCITT over [LEN, TYPE, PAYLOAD] -----------------
+        // --- Check 3: CRC-16/IBM-3740 over [LEN, TYPE, PAYLOAD] -------------
         uint16_t calc = packetCRC(len, type, &pkt[4]);
         uint16_t rcvd = (uint16_t)(((unsigned)pkt[4 + PAYLOAD_LEN] << 8) | pkt[4 + PAYLOAD_LEN + 1]);
 
