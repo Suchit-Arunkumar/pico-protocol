@@ -53,8 +53,8 @@ caller-owned `bytearray`.
 
 ## Vehicle-specific packet types are not upstreamed
 
-The AUV firmware this protocol was built for adds a TYPE `0x04` IMU packet
-(raw BNO055 register block) that is not defined here.
+TYPE `0x04` is not defined in this repo; it was only planned for an IMU
+packet.
 
 ## Host-side testing only
 
